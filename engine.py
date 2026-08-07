@@ -86,9 +86,83 @@ def fetch_yfinance_data(symbol: str, interval: str = "1d", limit: int = 1000) ->
 
 def fetch_data(market_type: str, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
     """Ponto único de entrada para buscar dados, roteando por tipo de mercado."""
-    if market_type == "Cripto":
+    config = MARKET_CONFIG[market_type]
+    if config["source"] == "ccxt":
         return fetch_crypto_data(symbol, timeframe=timeframe, limit=limit)
     return fetch_yfinance_data(symbol, interval=timeframe, limit=limit)
+
+
+# ---------------------------------------------------------------------------
+# Categorias de mercado, timeframes e candles padrão
+# ---------------------------------------------------------------------------
+#
+# A partir da simplificação do formulário, o usuário só escolhe uma categoria
+# ampla de mercado (Forex / Crypto / Índices / Stocks) — o ativo específico e
+# o timeframe vêm do texto da estratégia, interpretado pela IA em
+# strategy_parser.py. Este bloco resolve os defaults quando a IA não extrai
+# um ativo/timeframe explícito do texto.
+
+MARKET_CONFIG = {
+    "Forex": {"source": "yfinance", "default_symbol": "EURUSD=X"},
+    "Crypto": {"source": "ccxt", "default_symbol": "BTC/USDT"},
+    "Índices": {"source": "yfinance", "default_symbol": "^GSPC"},
+    "Stocks": {"source": "yfinance", "default_symbol": "AAPL"},
+}
+
+VALID_TIMEFRAMES = {
+    "yfinance": ["15m", "30m", "1h", "1d", "1wk"],
+    "ccxt": ["15m", "1h", "4h", "1d"],
+}
+
+DEFAULT_TIMEFRAME = {"yfinance": "1d", "ccxt": "1h"}
+
+# Nº de candles padrão por timeframe. Escolhido para aproximar o piso
+# recomendado de amostra estatisticamente relevante em backtests (na prática,
+# 200-500 trades executados é considerado confiável; abaixo de 100 trades os
+# resultados tendem a ser ruído) sem estourar os limites de histórico
+# disponíveis nas fontes de dados gratuitas (ex: yfinance intraday).
+DEFAULT_CANDLES_BY_TIMEFRAME = {
+    "1m": 2000,
+    "5m": 3000,
+    "15m": 3000,
+    "30m": 2500,
+    "1h": 2000,
+    "4h": 1500,
+    "1d": 750,
+    "1wk": 260,
+}
+DEFAULT_CANDLES_FALLBACK = 1500
+
+
+def timeframe_options(market_type: str) -> list[str]:
+    """Timeframes válidos para a fonte de dados da categoria de mercado escolhida."""
+    return VALID_TIMEFRAMES[MARKET_CONFIG[market_type]["source"]]
+
+
+def resolve_symbol(market_type: str, ai_symbol: str) -> str:
+    """Decide o ativo real a usar, a partir do que a IA extraiu do texto da estratégia.
+
+    Se a IA não identificou um ativo específico (ou identificou algo incompatível
+    com a categoria de mercado escolhida — ex: um par cripto com "/" numa
+    categoria que usa yfinance), cai para o ativo padrão daquela categoria.
+    """
+    config = MARKET_CONFIG[market_type]
+    source = config["source"]
+
+    symbol = (ai_symbol or "").strip()
+    looks_like_pair = "/" in symbol
+    if source == "ccxt":
+        if not symbol or not looks_like_pair:
+            symbol = config["default_symbol"]
+    else:
+        if not symbol or looks_like_pair:
+            symbol = config["default_symbol"]
+
+    return symbol
+
+
+def default_candle_count(timeframe: str) -> int:
+    return DEFAULT_CANDLES_BY_TIMEFRAME.get(timeframe, DEFAULT_CANDLES_FALLBACK)
 
 
 # ---------------------------------------------------------------------------

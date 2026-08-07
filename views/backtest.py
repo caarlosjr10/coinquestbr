@@ -13,7 +13,19 @@ import rate_limiter
 import reports
 import strategy_parser
 import subscriptions
-from engine import StrategyParams, calculate_metrics, fetch_data, get_current_signal, run_backtest, run_optimization
+from engine import (
+    DEFAULT_TIMEFRAME,
+    MARKET_CONFIG,
+    StrategyParams,
+    calculate_metrics,
+    default_candle_count,
+    fetch_data,
+    get_current_signal,
+    resolve_symbol,
+    run_backtest,
+    run_optimization,
+    timeframe_options,
+)
 from integrations import telegram_bot
 
 # ---------------------------------------------------------------------------
@@ -28,6 +40,9 @@ for key, default in {
     "strategy_interpreted": False,
     "strategy_supported": None,
     "strategy_notes": "",
+    "cfg_symbol": "",
+    "cfg_timeframe": "",
+    "cfg_n_candles": 0,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -123,23 +138,11 @@ is_vip = user_plan == "VIP"
 st.sidebar.info(f"Plano atual: **{user_plan}**")
 st.sidebar.page_link("views/planos.py", label="💳 Ver planos e assinar", icon="💳")
 
-st.sidebar.subheader("2. Mercado e Ativo")
-market_type = st.sidebar.selectbox("Mercado", ["Cripto", "Ações / Forex / Índices"])
-
-if market_type == "Cripto":
-    symbol = st.sidebar.text_input("Ticker (ccxt)", value="BTC/USDT", help="Ex: BTC/USDT, ETH/USDT")
-    timeframe = st.sidebar.selectbox("Timeframe", ["15m", "1h", "4h", "1d"], index=1)
-else:
-    symbol = st.sidebar.text_input("Ticker (yfinance)", value="AAPL", help="Ex: AAPL, EURUSD=X, PETR4.SA, ^GSPC")
-    timeframe = st.sidebar.selectbox("Timeframe", ["1h", "1d", "1wk"], index=1)
-
-n_candles = st.sidebar.slider("Nº de candles históricos", min_value=500, max_value=5000, value=1500, step=100)
-
-st.sidebar.subheader("3. Capital")
+st.sidebar.subheader("2. Capital")
 initial_capital = st.sidebar.number_input("Capital Inicial", min_value=100.0, value=10000.0, step=100.0)
-position_size_pct = st.sidebar.slider("% do capital por trade", min_value=1, max_value=100, value=100)
+position_size_pct = 100.0  # simplificado: sempre 100% do capital alocado por trade
 
-st.sidebar.subheader("4. Modo de Execução")
+st.sidebar.subheader("3. Modo de Execução")
 run_mode = st.sidebar.radio("Modo", ["Backtest Único", "Otimização (Grid Search)"])
 
 opt_fast_range = opt_slow_range = opt_sl_range = opt_tp_range = None
@@ -153,7 +156,7 @@ if run_mode == "Otimização (Grid Search)":
     max_combinations = st.sidebar.number_input("Máx. de combinações", min_value=10, max_value=500, value=100)
 
 # --- Painel do Bot Privado do Telegram (exclusivo VIP) ---
-st.sidebar.subheader("5. 🔔 Bot de Alertas do Telegram")
+st.sidebar.subheader("4. 🔔 Bot de Alertas do Telegram")
 if not is_vip:
     st.sidebar.caption("Disponível apenas no plano VIP / Institutional.")
 else:
@@ -178,21 +181,33 @@ else:
 
 st.title("📈 CoinQuestBR — Validação de Estratégias")
 
-st.markdown("#### 1. Descreva sua Estratégia")
+st.markdown("#### 1. Mercado e Timeframe")
+col_market, col_tf = st.columns(2)
+market_type = col_market.selectbox("Mercado", list(MARKET_CONFIG.keys()))
+
+tf_options = timeframe_options(market_type)
+tf_source = MARKET_CONFIG[market_type]["source"]
+tf_default = DEFAULT_TIMEFRAME[tf_source]
+tf_index = tf_options.index(tf_default) if tf_default in tf_options else 0
+timeframe = col_tf.selectbox("Timeframe", tf_options, index=tf_index)
+
+st.caption(f"{default_candle_count(timeframe)} candles históricos serão usados automaticamente para esse timeframe.")
+
+st.markdown("#### 2. Descreva sua Estratégia")
 st.caption(
-    f"Escreva do seu jeito, como explicaria pra um analista. A IA interpreta e já roda o "
-    f"backtest sobre os últimos {n_candles} candles de {symbol}, trazendo o resultado completo. "
-    "Suporte atual: cruzamento de médias móveis (SMA/EMA), filtro de RSI, Stop Loss e Take Profit."
+    "Suporte atual: cruzamento de médias móveis (SMA/EMA), filtro de RSI, Stop Loss e Take Profit. "
+    "A IA interpreta seu texto e já roda o backtest completo, trazendo o resultado."
 )
 
 strategy_description = st.text_area(
-    "Sua estratégia",
+    "Descreva sua estratégia da forma mais precisa possível (ex: \"Comprar quando a média móvel "
+    "exponencial de 9 períodos cruzar para cima da de 21 períodos, com RSI abaixo de 35. Sair com "
+    "stop loss de 2% ou take profit de 5%.\")",
     height=120,
     placeholder=(
-        "Exemplo: Comprar quando a média móvel exponencial de 9 períodos cruzar para cima da "
-        "de 21 períodos, com RSI abaixo de 35. Sair com stop loss de 2% ou take profit de 5%."
+        "Exemplo: Comprar quando a média móvel exponencial de 9 períodos cruzar para cima da de "
+        "21 períodos, com RSI abaixo de 35. Sair com stop loss de 2% ou take profit de 5%."
     ),
-    label_visibility="collapsed",
 )
 
 opt_ranges = (opt_fast_range, opt_slow_range, opt_sl_range, opt_tp_range) if run_mode != "Backtest Único" else None
@@ -215,6 +230,12 @@ if st.button("🚀 Analisar Estratégia", type="primary"):
                 st.session_state.cfg_sl = parsed["stop_loss_pct"]
                 st.session_state.cfg_tp = parsed["take_profit_pct"]
                 st.session_state.strategy_interpreted = True
+
+                symbol = resolve_symbol(market_type, parsed["symbol"])
+                n_candles = default_candle_count(timeframe)
+                st.session_state.cfg_symbol = symbol
+                st.session_state.cfg_timeframe = timeframe
+                st.session_state.cfg_n_candles = n_candles
 
                 base_params = StrategyParams(
                     ma_type=parsed["ma_type"], fast_period=parsed["fast_period"], slow_period=parsed["slow_period"],
@@ -246,6 +267,10 @@ if st.session_state.strategy_interpreted:
     )
 
     st.success(f"📋 **Estratégia interpretada:** {strategy_desc}")
+    st.caption(
+        f"Ativo: **{st.session_state.cfg_symbol}** · Timeframe: **{st.session_state.cfg_timeframe}** · "
+        f"{st.session_state.cfg_n_candles} candles históricos"
+    )
     if st.session_state.strategy_notes:
         st.caption(st.session_state.strategy_notes)
 
@@ -280,9 +305,12 @@ if st.session_state.strategy_interpreted:
                 take_profit_pct=st.session_state.cfg_tp,
                 initial_capital=initial_capital, position_size_pct=position_size_pct,
             )
+            st.session_state.cfg_timeframe = timeframe
+            st.session_state.cfg_n_candles = default_candle_count(timeframe)
             with st.spinner("Rodando backtest..."):
                 _run_backtest_flow(
-                    market_type, symbol, timeframe, n_candles, initial_capital, position_size_pct,
+                    market_type, st.session_state.cfg_symbol, timeframe,
+                    st.session_state.cfg_n_candles, initial_capital, position_size_pct,
                     run_mode, manual_params, opt_ranges, max_combinations,
                 )
             st.rerun()

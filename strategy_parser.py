@@ -38,6 +38,14 @@ SYSTEM_PROMPT = (
     "valores padrão (EMA 9/21, sem RSI, SL 2%, TP 4% — eles serão ignorados pela "
     "aplicação). "
     "\n\n"
+    "Além dos parâmetros da estratégia, extraia também:\n"
+    "- 'symbol': o ativo específico mencionado no texto, já no formato correto para busca "
+    "de dados (ex: 'Bitcoin' → 'BTC/USDT', 'Petrobras' → 'PETR4.SA', 'Euro Dólar' ou "
+    "'EUR/USD' → 'EURUSD=X', 'Ouro' → 'GC=F', 'S&P 500' → '^GSPC', 'Apple' → 'AAPL', "
+    "'Ibovespa' → '^BVSP'). Se nenhum ativo específico for mencionado, retorne uma string "
+    "vazia \"\" (o app usa um ativo padrão da categoria de mercado escolhida pelo "
+    "usuário).\n"
+    "\n\n"
     "REGRAS PARA 'interpretation_notes' (muito importantes):\n"
     "- Escreva no MÁXIMO 2 frases curtas, em português informal e direto.\n"
     "- Fale DIRETAMENTE com o usuário, na segunda pessoa ('você'). NUNCA escreva as "
@@ -66,12 +74,13 @@ STRATEGY_SCHEMA = {
         "rsi_overbought": {"type": "integer"},
         "stop_loss_pct": {"type": "number"},
         "take_profit_pct": {"type": "number"},
+        "symbol": {"type": "string"},
         "interpretation_notes": {"type": "string"},
     },
     "required": [
         "is_supported", "ma_type", "fast_period", "slow_period", "use_rsi_filter",
         "rsi_period", "rsi_oversold", "rsi_overbought",
-        "stop_loss_pct", "take_profit_pct", "interpretation_notes",
+        "stop_loss_pct", "take_profit_pct", "symbol", "interpretation_notes",
     ],
     "additionalProperties": False,
 }
@@ -87,6 +96,7 @@ _DEFAULTS = {
     "rsi_overbought": 70,
     "stop_loss_pct": 2.0,
     "take_profit_pct": 4.0,
+    "symbol": "",
     "interpretation_notes": "",
 }
 
@@ -109,6 +119,8 @@ def _clamp(parsed: dict) -> dict:
 
     if result["ma_type"] not in ("SMA", "EMA"):
         result["ma_type"] = "EMA"
+
+    result["symbol"] = str(result.get("symbol") or "").strip()
 
     return result
 

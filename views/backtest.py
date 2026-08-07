@@ -16,13 +16,16 @@ import subscriptions
 from engine import (
     DEFAULT_TIMEFRAME,
     MARKET_CONFIG,
+    SMCParams,
     StrategyParams,
     calculate_metrics,
     default_candle_count,
     fetch_data,
     get_current_signal,
+    get_current_signal_smc,
     resolve_symbol,
     run_backtest,
+    run_backtest_smc,
     run_optimization,
     timeframe_options,
 )
@@ -40,6 +43,7 @@ for key, default in {
     "strategy_interpreted": False,
     "strategy_supported": None,
     "strategy_notes": "",
+    "strategy_family": "classic",
     "cfg_symbol": "",
     "cfg_timeframe": "",
     "cfg_n_candles": 0,
@@ -48,15 +52,22 @@ for key, default in {
         st.session_state[key] = default
 
 
-def _build_strategy_desc(ma_type, fast, slow, use_rsi, sl, tp, suffix="") -> str:
+def _classic_desc(p: StrategyParams, suffix="") -> str:
     return (
-        f"Cruzamento {ma_type} {fast}/{slow}"
-        f"{' + filtro RSI' if use_rsi else ''}, "
-        f"SL {sl}% / TP {tp}%{suffix}"
+        f"Cruzamento {p.ma_type} {p.fast_period}/{p.slow_period}"
+        f"{' + filtro RSI' if p.use_rsi_filter else ''}, "
+        f"SL {p.stop_loss_pct}% / TP {p.take_profit_pct}%{suffix}"
     )
 
 
-def _run_backtest_flow(market_type, symbol, timeframe, n_candles, initial_capital, position_size_pct,
+def _smc_desc(p: SMCParams, suffix="") -> str:
+    return (
+        f"Reversão SMC — varredura + BOS + pullback + CHoCH (swing={p.swing_strength}, "
+        f"janela={p.max_setup_bars} candles), SL {p.stop_loss_pct}% / TP {p.take_profit_pct}%{suffix}"
+    )
+
+
+def _run_backtest_flow(family, market_type, symbol, timeframe, n_candles, initial_capital, position_size_pct,
                         run_mode, base_params, opt_ranges=None, max_combinations=None) -> None:
     """Busca os dados e roda o backtest (único ou otimização), guardando o resultado na sessão."""
     try:
@@ -65,19 +76,22 @@ def _run_backtest_flow(market_type, symbol, timeframe, n_candles, initial_capita
         st.error(f"Erro ao buscar dados para '{symbol}': {e}")
         return
 
-    if df.empty or len(df) < base_params.slow_period + 5:
+    min_bars = base_params.slow_period + 5 if family == "classic" else base_params.swing_strength * 2 + 10
+    if df.empty or len(df) < min_bars:
         st.error("Dados insuficientes para essa configuração. Tente aumentar o número de candles.")
         return
 
-    strategy_desc = _build_strategy_desc(
-        base_params.ma_type, base_params.fast_period, base_params.slow_period,
-        base_params.use_rsi_filter, base_params.stop_loss_pct, base_params.take_profit_pct,
-    )
-
     if run_mode == "Backtest Único":
-        trades, equity_df = run_backtest(df, base_params)
+        if family == "smc":
+            strategy_desc = _smc_desc(base_params)
+            trades, equity_df = run_backtest_smc(df, base_params)
+            current_signal = get_current_signal_smc(df, base_params)
+        else:
+            strategy_desc = _classic_desc(base_params)
+            trades, equity_df = run_backtest(df, base_params)
+            current_signal = get_current_signal(df, base_params)
+
         metrics = calculate_metrics(trades, equity_df, initial_capital)
-        current_signal = get_current_signal(df, base_params)
         st.session_state.backtest_result = {
             "mode": "single", "metrics": metrics, "equity_df": equity_df,
             "trades": trades, "symbol": symbol, "strategy_desc": strategy_desc,
@@ -108,10 +122,7 @@ def _run_backtest_flow(market_type, symbol, timeframe, n_candles, initial_capita
         )
         best_trades, best_equity_df = run_backtest(df, best_params)
         best_metrics = calculate_metrics(best_trades, best_equity_df, initial_capital)
-        best_strategy_desc = _build_strategy_desc(
-            base_params.ma_type, int(best["fast_period"]), int(best["slow_period"]), base_params.use_rsi_filter,
-            f"{best['stop_loss_pct']:.1f}", f"{best['take_profit_pct']:.1f}", suffix=" (melhor combinação)",
-        )
+        best_strategy_desc = _classic_desc(best_params, suffix=" (melhor combinação)")
         current_signal = get_current_signal(df, best_params)
 
         st.session_state.backtest_result = {
@@ -155,6 +166,8 @@ run_mode = st.sidebar.radio(
     ),
 )
 run_mode = "Backtest Único" if run_mode == "Testar como descrevi" else "Otimização (Grid Search)"
+if run_mode == "Otimização (Grid Search)":
+    st.sidebar.caption("⚠️ Otimização automática só está disponível para estratégias de médias móveis/RSI.")
 
 opt_fast_range = opt_slow_range = opt_sl_range = opt_tp_range = None
 max_combinations = None
@@ -225,15 +238,8 @@ if st.button("🚀 Analisar Estratégia", type="primary"):
             st.session_state.strategy_supported = parsed["is_supported"]
 
             if parsed["is_supported"]:
-                st.session_state.cfg_ma_type = parsed["ma_type"]
-                st.session_state.cfg_fast_period = parsed["fast_period"]
-                st.session_state.cfg_slow_period = parsed["slow_period"]
-                st.session_state.cfg_use_rsi = parsed["use_rsi_filter"]
-                st.session_state.cfg_rsi_period = parsed["rsi_period"]
-                st.session_state.cfg_rsi_oversold = parsed["rsi_oversold"]
-                st.session_state.cfg_rsi_overbought = parsed["rsi_overbought"]
-                st.session_state.cfg_sl = parsed["stop_loss_pct"]
-                st.session_state.cfg_tp = parsed["take_profit_pct"]
+                family = parsed["strategy_family"]
+                st.session_state.strategy_family = family
                 st.session_state.strategy_interpreted = True
 
                 symbol = resolve_symbol(market_type, parsed["symbol"])
@@ -241,17 +247,40 @@ if st.button("🚀 Analisar Estratégia", type="primary"):
                 st.session_state.cfg_symbol = symbol
                 st.session_state.cfg_timeframe = timeframe
                 st.session_state.cfg_n_candles = n_candles
+                st.session_state.cfg_sl = parsed["stop_loss_pct"]
+                st.session_state.cfg_tp = parsed["take_profit_pct"]
 
-                base_params = StrategyParams(
-                    ma_type=parsed["ma_type"], fast_period=parsed["fast_period"], slow_period=parsed["slow_period"],
-                    use_rsi_filter=parsed["use_rsi_filter"], rsi_period=parsed["rsi_period"],
-                    rsi_oversold=parsed["rsi_oversold"], rsi_overbought=parsed["rsi_overbought"],
-                    stop_loss_pct=parsed["stop_loss_pct"], take_profit_pct=parsed["take_profit_pct"],
-                    initial_capital=initial_capital, position_size_pct=position_size_pct,
-                )
+                effective_run_mode = run_mode
+                if family == "smc":
+                    st.session_state.cfg_swing_strength = parsed["swing_strength"]
+                    st.session_state.cfg_max_setup_bars = parsed["max_setup_bars"]
+                    base_params = SMCParams(
+                        swing_strength=parsed["swing_strength"], max_setup_bars=parsed["max_setup_bars"],
+                        stop_loss_pct=parsed["stop_loss_pct"], take_profit_pct=parsed["take_profit_pct"],
+                        initial_capital=initial_capital, position_size_pct=position_size_pct,
+                    )
+                    if run_mode != "Backtest Único":
+                        st.info("Otimização automática ainda não está disponível para estratégias SMC — rodando o backtest único.")
+                        effective_run_mode = "Backtest Único"
+                else:
+                    st.session_state.cfg_ma_type = parsed["ma_type"]
+                    st.session_state.cfg_fast_period = parsed["fast_period"]
+                    st.session_state.cfg_slow_period = parsed["slow_period"]
+                    st.session_state.cfg_use_rsi = parsed["use_rsi_filter"]
+                    st.session_state.cfg_rsi_period = parsed["rsi_period"]
+                    st.session_state.cfg_rsi_oversold = parsed["rsi_oversold"]
+                    st.session_state.cfg_rsi_overbought = parsed["rsi_overbought"]
+                    base_params = StrategyParams(
+                        ma_type=parsed["ma_type"], fast_period=parsed["fast_period"], slow_period=parsed["slow_period"],
+                        use_rsi_filter=parsed["use_rsi_filter"], rsi_period=parsed["rsi_period"],
+                        rsi_oversold=parsed["rsi_oversold"], rsi_overbought=parsed["rsi_overbought"],
+                        stop_loss_pct=parsed["stop_loss_pct"], take_profit_pct=parsed["take_profit_pct"],
+                        initial_capital=initial_capital, position_size_pct=position_size_pct,
+                    )
+
                 _run_backtest_flow(
-                    market_type, symbol, timeframe, n_candles, initial_capital, position_size_pct,
-                    run_mode, base_params, opt_ranges, max_combinations,
+                    family, market_type, symbol, timeframe, n_candles, initial_capital, position_size_pct,
+                    effective_run_mode, base_params, opt_ranges, max_combinations,
                 )
             else:
                 st.session_state.strategy_interpreted = False
@@ -266,10 +295,18 @@ if st.session_state.strategy_supported is False:
     st.error(f"⚠️ {st.session_state.strategy_notes}")
 
 if st.session_state.strategy_interpreted:
-    strategy_desc = _build_strategy_desc(
-        st.session_state.cfg_ma_type, st.session_state.cfg_fast_period, st.session_state.cfg_slow_period,
-        st.session_state.cfg_use_rsi, st.session_state.cfg_sl, st.session_state.cfg_tp,
-    )
+    if st.session_state.strategy_family == "smc":
+        strategy_desc = _smc_desc(SMCParams(
+            swing_strength=st.session_state.cfg_swing_strength,
+            max_setup_bars=st.session_state.cfg_max_setup_bars,
+            stop_loss_pct=st.session_state.cfg_sl, take_profit_pct=st.session_state.cfg_tp,
+        ))
+    else:
+        strategy_desc = _classic_desc(StrategyParams(
+            ma_type=st.session_state.cfg_ma_type, fast_period=st.session_state.cfg_fast_period,
+            slow_period=st.session_state.cfg_slow_period, use_rsi_filter=st.session_state.cfg_use_rsi,
+            stop_loss_pct=st.session_state.cfg_sl, take_profit_pct=st.session_state.cfg_tp,
+        ))
 
     st.success(f"📋 **Estratégia interpretada:** {strategy_desc}")
     st.caption(
@@ -280,43 +317,66 @@ if st.session_state.strategy_interpreted:
         st.caption(st.session_state.strategy_notes)
 
     with st.expander("⚙️ Ajustar parâmetros manualmente"):
-        col1, col2 = st.columns(2)
-        col1.selectbox("Tipo de Média Móvel", ["EMA", "SMA"], key="cfg_ma_type")
-        col_fast, col_slow = st.columns(2)
-        col_fast.number_input("Período Rápido", min_value=2, max_value=200, key="cfg_fast_period")
-        col_slow.number_input("Período Lento", min_value=3, max_value=400, key="cfg_slow_period")
+        family = st.session_state.strategy_family
 
-        use_rsi_filter = st.checkbox("Usar filtro de RSI", key="cfg_use_rsi")
-        if use_rsi_filter:
-            st.number_input("Período RSI", min_value=2, max_value=100, key="cfg_rsi_period")
-            col_os, col_ob = st.columns(2)
-            col_os.number_input("RSI Sobrevenda", min_value=1, max_value=50, key="cfg_rsi_oversold")
-            col_ob.number_input("RSI Sobrecompra", min_value=50, max_value=99, key="cfg_rsi_overbought")
+        if family == "smc":
+            col_sw, col_win = st.columns(2)
+            col_sw.number_input(
+                "Força do swing (candles de cada lado)", min_value=1, max_value=10, key="cfg_swing_strength",
+                help="Quantos candles de cada lado confirmam um topo/fundo. Valores maiores = estrutura mais suave, sinais mais raros.",
+            )
+            col_win.number_input(
+                "Janela máx. do setup (candles)", min_value=5, max_value=200, key="cfg_max_setup_bars",
+                help="Quantos candles esperar entre a varredura de liquidez e a confirmação de entrada antes de descartar o setup.",
+            )
+        else:
+            col1, col2 = st.columns(2)
+            col1.selectbox("Tipo de Média Móvel", ["EMA", "SMA"], key="cfg_ma_type")
+            col_fast, col_slow = st.columns(2)
+            col_fast.number_input("Período Rápido", min_value=2, max_value=200, key="cfg_fast_period")
+            col_slow.number_input("Período Lento", min_value=3, max_value=400, key="cfg_slow_period")
+
+            use_rsi_filter = st.checkbox("Usar filtro de RSI", key="cfg_use_rsi")
+            if use_rsi_filter:
+                st.number_input("Período RSI", min_value=2, max_value=100, key="cfg_rsi_period")
+                col_os, col_ob = st.columns(2)
+                col_os.number_input("RSI Sobrevenda", min_value=1, max_value=50, key="cfg_rsi_oversold")
+                col_ob.number_input("RSI Sobrecompra", min_value=50, max_value=99, key="cfg_rsi_overbought")
 
         col_sl, col_tp = st.columns(2)
         col_sl.number_input("Stop Loss (%)", min_value=0.1, max_value=50.0, step=0.1, key="cfg_sl")
         col_tp.number_input("Take Profit (%)", min_value=0.1, max_value=100.0, step=0.1, key="cfg_tp")
 
         if st.button("🔄 Rodar novamente com esses parâmetros"):
-            manual_params = StrategyParams(
-                ma_type=st.session_state.cfg_ma_type,
-                fast_period=st.session_state.cfg_fast_period,
-                slow_period=st.session_state.cfg_slow_period,
-                use_rsi_filter=st.session_state.cfg_use_rsi,
-                rsi_period=st.session_state.cfg_rsi_period,
-                rsi_oversold=st.session_state.cfg_rsi_oversold,
-                rsi_overbought=st.session_state.cfg_rsi_overbought,
-                stop_loss_pct=st.session_state.cfg_sl,
-                take_profit_pct=st.session_state.cfg_tp,
-                initial_capital=initial_capital, position_size_pct=position_size_pct,
-            )
+            if family == "smc":
+                manual_params = SMCParams(
+                    swing_strength=st.session_state.cfg_swing_strength,
+                    max_setup_bars=st.session_state.cfg_max_setup_bars,
+                    stop_loss_pct=st.session_state.cfg_sl,
+                    take_profit_pct=st.session_state.cfg_tp,
+                    initial_capital=initial_capital, position_size_pct=position_size_pct,
+                )
+            else:
+                manual_params = StrategyParams(
+                    ma_type=st.session_state.cfg_ma_type,
+                    fast_period=st.session_state.cfg_fast_period,
+                    slow_period=st.session_state.cfg_slow_period,
+                    use_rsi_filter=st.session_state.cfg_use_rsi,
+                    rsi_period=st.session_state.cfg_rsi_period,
+                    rsi_oversold=st.session_state.cfg_rsi_oversold,
+                    rsi_overbought=st.session_state.cfg_rsi_overbought,
+                    stop_loss_pct=st.session_state.cfg_sl,
+                    take_profit_pct=st.session_state.cfg_tp,
+                    initial_capital=initial_capital, position_size_pct=position_size_pct,
+                )
             st.session_state.cfg_timeframe = timeframe
             st.session_state.cfg_n_candles = default_candle_count(timeframe)
+            effective_run_mode = "Backtest Único" if family == "smc" else run_mode
             with st.spinner("Rodando backtest..."):
                 _run_backtest_flow(
-                    market_type, st.session_state.cfg_symbol, timeframe,
+                    family, market_type, st.session_state.cfg_symbol, timeframe,
                     st.session_state.cfg_n_candles, initial_capital, position_size_pct,
-                    run_mode, manual_params, opt_ranges, max_combinations,
+                    effective_run_mode, manual_params, opt_ranges, max_combinations,
                 )
             st.rerun()
 
@@ -383,7 +443,8 @@ else:
 
     current_signal = result.get("current_signal") or {}
     if current_signal.get("signal"):
-        emoji = "🟢" if current_signal["signal"] == "Compra" else "🔴"
+        _signal_emoji = {"Compra": "🟢", "Venda (short)": "🔴", "Saída": "🟡"}
+        emoji = _signal_emoji.get(current_signal["signal"], "⚪")
         st.markdown("---")
         st.markdown(f"#### {emoji} Sinal Ativo no Último Candle: {current_signal['signal']}")
         st.caption(

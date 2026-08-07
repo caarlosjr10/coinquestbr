@@ -96,11 +96,11 @@ def fetch_data(market_type: str, symbol: str, timeframe: str, limit: int) -> pd.
 # Categorias de mercado, timeframes e candles padrão
 # ---------------------------------------------------------------------------
 #
-# A partir da simplificação do formulário, o usuário só escolhe uma categoria
-# ampla de mercado (Forex / Crypto / Índices / Stocks) — o ativo específico e
-# o timeframe vêm do texto da estratégia, interpretado pela IA em
-# strategy_parser.py. Este bloco resolve os defaults quando a IA não extrai
-# um ativo/timeframe explícito do texto.
+# A partir da simplificação do formulário, o usuário escolhe uma categoria
+# ampla de mercado (Forex / Crypto / Índices / Stocks) e um timeframe no topo
+# da página — o ativo específico (ticker exato) vem do texto da estratégia,
+# interpretado pela IA em strategy_parser.py. Este bloco resolve o ativo
+# padrão quando a IA não extrai um ativo explícito do texto.
 
 MARKET_CONFIG = {
     "Forex": {"source": "yfinance", "default_symbol": "EURUSD=X"},
@@ -110,8 +110,8 @@ MARKET_CONFIG = {
 }
 
 VALID_TIMEFRAMES = {
-    "yfinance": ["15m", "30m", "1h", "1d", "1wk"],
-    "ccxt": ["15m", "1h", "4h", "1d"],
+    "yfinance": ["1m", "5m", "15m", "30m", "1h", "1d", "1wk"],
+    "ccxt": ["1m", "5m", "15m", "1h", "4h", "1d"],
 }
 
 DEFAULT_TIMEFRAME = {"yfinance": "1d", "ccxt": "1h"}
@@ -122,8 +122,8 @@ DEFAULT_TIMEFRAME = {"yfinance": "1d", "ccxt": "1h"}
 # resultados tendem a ser ruído) sem estourar os limites de histórico
 # disponíveis nas fontes de dados gratuitas (ex: yfinance intraday).
 DEFAULT_CANDLES_BY_TIMEFRAME = {
-    "1m": 2000,
-    "5m": 3000,
+    "1m": 1500,   # yfinance só guarda ~7 dias de histórico em 1m
+    "5m": 2500,   # yfinance só guarda ~60 dias de histórico em 5m
     "15m": 3000,
     "30m": 2500,
     "1h": 2000,

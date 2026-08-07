@@ -136,19 +136,30 @@ user_plan = subscriptions.get_plan_for_email(user_email)
 is_vip = user_plan == "VIP"
 
 st.sidebar.info(f"Plano atual: **{user_plan}**")
-st.sidebar.page_link("views/planos.py", label="💳 Ver planos e assinar", icon="💳")
+st.sidebar.page_link("views/planos.py", label="Ver planos e assinar", icon="💳")
 
 st.sidebar.subheader("2. Capital")
 initial_capital = st.sidebar.number_input("Capital Inicial", min_value=100.0, value=10000.0, step=100.0)
 position_size_pct = 100.0  # simplificado: sempre 100% do capital alocado por trade
 
 st.sidebar.subheader("3. Modo de Execução")
-run_mode = st.sidebar.radio("Modo", ["Backtest Único", "Otimização (Grid Search)"])
+run_mode = st.sidebar.radio(
+    "Modo",
+    ["Testar como descrevi", "Otimizar automaticamente"],
+    help=(
+        "**Testar como descrevi:** roda o backtest exatamente com os parâmetros que a IA "
+        "identificou na sua estratégia.\n\n"
+        "**Otimizar automaticamente:** testa dezenas de pequenas variações da sua estratégia "
+        "(outros períodos de média, outros stops/alvos) e te mostra a combinação com melhor "
+        "resultado histórico."
+    ),
+)
+run_mode = "Backtest Único" if run_mode == "Testar como descrevi" else "Otimização (Grid Search)"
 
 opt_fast_range = opt_slow_range = opt_sl_range = opt_tp_range = None
 max_combinations = None
 if run_mode == "Otimização (Grid Search)":
-    st.sidebar.caption("Testa várias combinações de período rápido/lento e SL/TP, mantendo o filtro de RSI da estratégia interpretada.")
+    st.sidebar.caption("Ajuste as faixas de valores que o sistema deve testar automaticamente:")
     opt_fast_range = st.sidebar.slider("Faixa Período Rápido", 2, 50, (5, 15))
     opt_slow_range = st.sidebar.slider("Faixa Período Lento", 10, 100, (20, 40))
     opt_sl_range = st.sidebar.slider("Faixa Stop Loss (%)", 0.5, 10.0, (1.0, 3.0))
@@ -194,15 +205,9 @@ timeframe = col_tf.selectbox("Timeframe", tf_options, index=tf_index)
 st.caption(f"{default_candle_count(timeframe)} candles históricos serão usados automaticamente para esse timeframe.")
 
 st.markdown("#### 2. Descreva sua Estratégia")
-st.caption(
-    "Suporte atual: cruzamento de médias móveis (SMA/EMA), filtro de RSI, Stop Loss e Take Profit. "
-    "A IA interpreta seu texto e já roda o backtest completo, trazendo o resultado."
-)
 
 strategy_description = st.text_area(
-    "Descreva sua estratégia da forma mais precisa possível (ex: \"Comprar quando a média móvel "
-    "exponencial de 9 períodos cruzar para cima da de 21 períodos, com RSI abaixo de 35. Sair com "
-    "stop loss de 2% ou take profit de 5%.\")",
+    "Descreva sua estratégia da forma mais precisa possível",
     height=120,
     placeholder=(
         "Exemplo: Comprar quando a média móvel exponencial de 9 períodos cruzar para cima da de "

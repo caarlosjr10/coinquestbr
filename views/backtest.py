@@ -4,6 +4,8 @@ por IA), backtest, dashboard de métricas, parecer técnico, exportação e
 alertas via Telegram.
 """
 
+from dataclasses import replace
+
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -20,9 +22,12 @@ from engine import (
     StrategyParams,
     calculate_metrics,
     default_candle_count,
+    describe_active_filters,
+    describe_trigger,
     fetch_data,
     get_current_signal,
     get_current_signal_smc,
+    required_warmup_bars,
     resolve_symbol,
     run_backtest,
     run_backtest_smc,
@@ -30,6 +35,23 @@ from engine import (
     timeframe_options,
 )
 from integrations import telegram_bot
+
+# Campos de StrategyParams preenchidos pela IA (strategy_parser) e espelhados
+# em st.session_state como "cfg_<campo>" — usados tanto para montar o
+# StrategyParams quanto para os widgets do expander "Ajustar manualmente".
+# stop_loss_pct/take_profit_pct ficam de fora — são compartilhados com a
+# família SMC via "cfg_sl"/"cfg_tp".
+CLASSIC_PARAM_FIELDS = [
+    "entry_trigger", "ma_type", "fast_period", "slow_period", "bb_period", "bb_std",
+    "donchian_period", "candle_pattern",
+    "use_rsi_filter", "rsi_period", "rsi_oversold", "rsi_overbought",
+    "use_macd_filter", "macd_fast", "macd_slow", "macd_signal",
+    "use_volume_filter", "volume_period", "volume_multiplier",
+    "use_stochastic_filter", "stoch_k_period", "stoch_d_period", "stoch_oversold", "stoch_overbought",
+    "use_adx_filter", "adx_period", "adx_threshold",
+    "use_williams_filter", "williams_period", "williams_oversold", "williams_overbought",
+    "use_cci_filter", "cci_period", "cci_oversold", "cci_overbought",
+]
 
 # ---------------------------------------------------------------------------
 # Estado da sessão
@@ -52,12 +74,18 @@ for key, default in {
         st.session_state[key] = default
 
 
-def _classic_desc(p: StrategyParams, suffix="") -> str:
-    return (
-        f"Cruzamento {p.ma_type} {p.fast_period}/{p.slow_period}"
-        f"{' + filtro RSI' if p.use_rsi_filter else ''}, "
-        f"SL {p.stop_loss_pct}% / TP {p.take_profit_pct}%{suffix}"
+def _classic_params_from_session(initial_capital=10000.0, position_size_pct=100.0) -> StrategyParams:
+    return StrategyParams(
+        **{k: st.session_state[f"cfg_{k}"] for k in CLASSIC_PARAM_FIELDS},
+        stop_loss_pct=st.session_state.cfg_sl, take_profit_pct=st.session_state.cfg_tp,
+        initial_capital=initial_capital, position_size_pct=position_size_pct,
     )
+
+
+def _classic_desc(p: StrategyParams, suffix="") -> str:
+    filters = describe_active_filters(p)
+    filters_txt = f" + filtro {'/'.join(filters)}" if filters else ""
+    return f"{describe_trigger(p)}{filters_txt}, SL {p.stop_loss_pct}% / TP {p.take_profit_pct}%{suffix}"
 
 
 def _smc_desc(p: SMCParams, suffix="") -> str:
@@ -68,18 +96,22 @@ def _smc_desc(p: SMCParams, suffix="") -> str:
 
 
 def _run_backtest_flow(family, market_type, symbol, timeframe, n_candles, initial_capital, position_size_pct,
-                        run_mode, base_params, opt_ranges=None, max_combinations=None) -> None:
-    """Busca os dados e roda o backtest (único ou otimização), guardando o resultado na sessão."""
+                        run_mode, base_params, opt_ranges=None, max_combinations=None) -> bool:
+    """Busca os dados e roda o backtest (único ou otimização), guardando o resultado na sessão.
+
+    Retorna True se um backtest foi de fato executado (usado para contar o uso
+    contra o limite mensal do plano), False se falhou antes de rodar.
+    """
     try:
         df = fetch_data(market_type, symbol, timeframe, n_candles)
     except Exception as e:
         st.error(f"Erro ao buscar dados para '{symbol}': {e}")
-        return
+        return False
 
-    min_bars = base_params.slow_period + 5 if family == "classic" else base_params.swing_strength * 2 + 10
+    min_bars = required_warmup_bars(base_params) if family == "classic" else base_params.swing_strength * 2 + 10
     if df.empty or len(df) < min_bars:
         st.error("Dados insuficientes para essa configuração. Tente aumentar o número de candles.")
-        return
+        return False
 
     if run_mode == "Backtest Único":
         if family == "smc":
@@ -110,15 +142,12 @@ def _run_backtest_flow(family, market_type, symbol, timeframe, n_candles, initia
 
         if results_df.empty:
             st.warning("Nenhuma combinação válida encontrada (verifique se período rápido < período lento).")
-            return
+            return False
 
         best = results_df.iloc[0]
-        best_params = StrategyParams(
-            ma_type=base_params.ma_type, fast_period=int(best["fast_period"]), slow_period=int(best["slow_period"]),
-            use_rsi_filter=base_params.use_rsi_filter, rsi_period=base_params.rsi_period,
-            rsi_oversold=base_params.rsi_oversold, rsi_overbought=base_params.rsi_overbought,
+        best_params = replace(
+            base_params, fast_period=int(best["fast_period"]), slow_period=int(best["slow_period"]),
             stop_loss_pct=best["stop_loss_pct"], take_profit_pct=best["take_profit_pct"],
-            initial_capital=initial_capital, position_size_pct=position_size_pct,
         )
         best_trades, best_equity_df = run_backtest(df, best_params)
         best_metrics = calculate_metrics(best_trades, best_equity_df, initial_capital)
@@ -132,6 +161,7 @@ def _run_backtest_flow(family, market_type, symbol, timeframe, n_candles, initia
         }
 
     st.session_state.ai_report = None
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +260,20 @@ strategy_description = st.text_area(
 
 opt_ranges = (opt_fast_range, opt_slow_range, opt_sl_range, opt_tp_range) if run_mode != "Backtest Único" else None
 
-if st.button("🚀 Analisar Estratégia", type="primary"):
+bt_allowed, bt_used, bt_limit = (False, 0, None)
+if user_email:
+    bt_allowed, bt_used, bt_limit = rate_limiter.check_limit(user_email, user_plan, kind="backtest")
+    st.caption(f"Backtests este mês: {bt_used}/{bt_limit} ({user_plan})")
+    if not bt_allowed:
+        if user_plan == "Grátis":
+            upgrade_msg = "Faça upgrade para o plano **Pro** ou **VIP** para rodar muito mais backtests por mês."
+        else:
+            upgrade_msg = "Seu limite será renovado no próximo mês."
+        st.error(f"⚠️ Você atingiu o limite de {bt_limit} backtests no plano **{user_plan}** este mês. {upgrade_msg}")
+else:
+    st.caption("Informe seu e-mail na barra lateral para rodar o backtest.")
+
+if st.button("🚀 Analisar Estratégia", type="primary", disabled=not (user_email and bt_allowed)):
     with st.spinner("Interpretando sua estratégia e rodando o backtest..."):
         try:
             parsed = strategy_parser.parse_strategy_text(strategy_description)
@@ -263,25 +306,23 @@ if st.button("🚀 Analisar Estratégia", type="primary"):
                         st.info("Otimização automática ainda não está disponível para estratégias SMC — rodando o backtest único.")
                         effective_run_mode = "Backtest Único"
                 else:
-                    st.session_state.cfg_ma_type = parsed["ma_type"]
-                    st.session_state.cfg_fast_period = parsed["fast_period"]
-                    st.session_state.cfg_slow_period = parsed["slow_period"]
-                    st.session_state.cfg_use_rsi = parsed["use_rsi_filter"]
-                    st.session_state.cfg_rsi_period = parsed["rsi_period"]
-                    st.session_state.cfg_rsi_oversold = parsed["rsi_oversold"]
-                    st.session_state.cfg_rsi_overbought = parsed["rsi_overbought"]
+                    for k in CLASSIC_PARAM_FIELDS:
+                        st.session_state[f"cfg_{k}"] = parsed[k]
                     base_params = StrategyParams(
-                        ma_type=parsed["ma_type"], fast_period=parsed["fast_period"], slow_period=parsed["slow_period"],
-                        use_rsi_filter=parsed["use_rsi_filter"], rsi_period=parsed["rsi_period"],
-                        rsi_oversold=parsed["rsi_oversold"], rsi_overbought=parsed["rsi_overbought"],
+                        **{k: parsed[k] for k in CLASSIC_PARAM_FIELDS},
                         stop_loss_pct=parsed["stop_loss_pct"], take_profit_pct=parsed["take_profit_pct"],
                         initial_capital=initial_capital, position_size_pct=position_size_pct,
                     )
+                    if base_params.entry_trigger != "ma_cross" and run_mode != "Backtest Único":
+                        st.info("Otimização automática só está disponível para o gatilho de cruzamento de médias — rodando o backtest único.")
+                        effective_run_mode = "Backtest Único"
 
-                _run_backtest_flow(
+                ran = _run_backtest_flow(
                     family, market_type, symbol, timeframe, n_candles, initial_capital, position_size_pct,
                     effective_run_mode, base_params, opt_ranges, max_combinations,
                 )
+                if ran:
+                    rate_limiter.increment_usage(user_email, kind="backtest")
             else:
                 st.session_state.strategy_interpreted = False
                 st.session_state.backtest_result = None
@@ -302,11 +343,7 @@ if st.session_state.strategy_interpreted:
             stop_loss_pct=st.session_state.cfg_sl, take_profit_pct=st.session_state.cfg_tp,
         ))
     else:
-        strategy_desc = _classic_desc(StrategyParams(
-            ma_type=st.session_state.cfg_ma_type, fast_period=st.session_state.cfg_fast_period,
-            slow_period=st.session_state.cfg_slow_period, use_rsi_filter=st.session_state.cfg_use_rsi,
-            stop_loss_pct=st.session_state.cfg_sl, take_profit_pct=st.session_state.cfg_tp,
-        ))
+        strategy_desc = _classic_desc(_classic_params_from_session())
 
     st.success(f"📋 **Estratégia interpretada:** {strategy_desc}")
     st.caption(
@@ -330,24 +367,92 @@ if st.session_state.strategy_interpreted:
                 help="Quantos candles esperar entre a varredura de liquidez e a confirmação de entrada antes de descartar o setup.",
             )
         else:
-            col1, col2 = st.columns(2)
-            col1.selectbox("Tipo de Média Móvel", ["EMA", "SMA"], key="cfg_ma_type")
-            col_fast, col_slow = st.columns(2)
-            col_fast.number_input("Período Rápido", min_value=2, max_value=200, key="cfg_fast_period")
-            col_slow.number_input("Período Lento", min_value=3, max_value=400, key="cfg_slow_period")
+            trigger_labels = {
+                "ma_cross": "Cruzamento de Médias Móveis", "bb_reversal": "Reversão nas Bandas de Bollinger",
+                "donchian_breakout": "Rompimento de Canal (Donchian)", "candle_pattern": "Padrão de Candle",
+            }
+            trigger_keys = list(trigger_labels.keys())
+            st.selectbox(
+                "Gatilho de entrada", trigger_keys, format_func=lambda k: trigger_labels[k], key="cfg_entry_trigger",
+            )
 
-            use_rsi_filter = st.checkbox("Usar filtro de RSI", key="cfg_use_rsi")
+            if st.session_state.cfg_entry_trigger == "ma_cross":
+                col1, col2 = st.columns(2)
+                col1.selectbox("Tipo de Média Móvel", ["EMA", "SMA"], key="cfg_ma_type")
+                col_fast, col_slow = st.columns(2)
+                col_fast.number_input("Período Rápido", min_value=2, max_value=200, key="cfg_fast_period")
+                col_slow.number_input("Período Lento", min_value=3, max_value=400, key="cfg_slow_period")
+            elif st.session_state.cfg_entry_trigger == "bb_reversal":
+                col_bp, col_bs = st.columns(2)
+                col_bp.number_input("Período Bollinger", min_value=5, max_value=200, key="cfg_bb_period")
+                col_bs.number_input("Desvio Padrão", min_value=0.5, max_value=5.0, step=0.1, key="cfg_bb_std")
+            elif st.session_state.cfg_entry_trigger == "donchian_breakout":
+                st.number_input("Período do Canal (candles)", min_value=5, max_value=200, key="cfg_donchian_period")
+            else:
+                st.selectbox(
+                    "Padrão de Candle", ["bullish_engulfing", "hammer"],
+                    format_func=lambda k: "Engolfo de Alta" if k == "bullish_engulfing" else "Martelo",
+                    key="cfg_candle_pattern",
+                )
+
+            st.markdown("**Filtros adicionais** (combinados com o gatilho acima)")
+
+            use_rsi_filter = st.checkbox("RSI", key="cfg_use_rsi_filter")
             if use_rsi_filter:
                 st.number_input("Período RSI", min_value=2, max_value=100, key="cfg_rsi_period")
                 col_os, col_ob = st.columns(2)
                 col_os.number_input("RSI Sobrevenda", min_value=1, max_value=50, key="cfg_rsi_oversold")
                 col_ob.number_input("RSI Sobrecompra", min_value=50, max_value=99, key="cfg_rsi_overbought")
 
+            use_macd_filter = st.checkbox("MACD (linha acima do sinal)", key="cfg_use_macd_filter")
+            if use_macd_filter:
+                col_mf, col_ms, col_msig = st.columns(3)
+                col_mf.number_input("MACD Rápido", min_value=2, max_value=100, key="cfg_macd_fast")
+                col_ms.number_input("MACD Lento", min_value=3, max_value=200, key="cfg_macd_slow")
+                col_msig.number_input("MACD Sinal", min_value=2, max_value=100, key="cfg_macd_signal")
+
+            use_volume_filter = st.checkbox("Volume acima da média", key="cfg_use_volume_filter")
+            if use_volume_filter:
+                col_vp, col_vm = st.columns(2)
+                col_vp.number_input("Período Volume", min_value=2, max_value=200, key="cfg_volume_period")
+                col_vm.number_input("Multiplicador", min_value=1.0, max_value=10.0, step=0.1, key="cfg_volume_multiplier")
+
+            use_stochastic_filter = st.checkbox("Estocástico", key="cfg_use_stochastic_filter")
+            if use_stochastic_filter:
+                col_sk, col_sd = st.columns(2)
+                col_sk.number_input("Período %K", min_value=2, max_value=100, key="cfg_stoch_k_period")
+                col_sd.number_input("Período %D", min_value=1, max_value=50, key="cfg_stoch_d_period")
+                col_so, col_sb = st.columns(2)
+                col_so.number_input("Sobrevenda", min_value=1, max_value=50, key="cfg_stoch_oversold")
+                col_sb.number_input("Sobrecompra", min_value=50, max_value=99, key="cfg_stoch_overbought")
+
+            use_adx_filter = st.checkbox("ADX (força de tendência)", key="cfg_use_adx_filter")
+            if use_adx_filter:
+                col_ap, col_at = st.columns(2)
+                col_ap.number_input("Período ADX", min_value=2, max_value=100, key="cfg_adx_period")
+                col_at.number_input("Limiar ADX", min_value=5.0, max_value=60.0, step=1.0, key="cfg_adx_threshold")
+
+            use_williams_filter = st.checkbox("Williams %R", key="cfg_use_williams_filter")
+            if use_williams_filter:
+                st.number_input("Período Williams %R", min_value=2, max_value=100, key="cfg_williams_period")
+                col_wo, col_wb = st.columns(2)
+                col_wo.number_input("Sobrevenda", min_value=-100.0, max_value=-50.0, step=1.0, key="cfg_williams_oversold")
+                col_wb.number_input("Sobrecompra", min_value=-50.0, max_value=0.0, step=1.0, key="cfg_williams_overbought")
+
+            use_cci_filter = st.checkbox("CCI", key="cfg_use_cci_filter")
+            if use_cci_filter:
+                st.number_input("Período CCI", min_value=2, max_value=200, key="cfg_cci_period")
+                col_co, col_cb = st.columns(2)
+                col_co.number_input("Sobrevenda", min_value=-300.0, max_value=-50.0, step=10.0, key="cfg_cci_oversold")
+                col_cb.number_input("Sobrecompra", min_value=50.0, max_value=300.0, step=10.0, key="cfg_cci_overbought")
+
         col_sl, col_tp = st.columns(2)
         col_sl.number_input("Stop Loss (%)", min_value=0.1, max_value=50.0, step=0.1, key="cfg_sl")
         col_tp.number_input("Take Profit (%)", min_value=0.1, max_value=100.0, step=0.1, key="cfg_tp")
 
-        if st.button("🔄 Rodar novamente com esses parâmetros"):
+        if not bt_allowed:
+            st.caption(f"⚠️ Limite de {bt_limit} backtests do plano {user_plan} atingido este mês.")
+        if st.button("🔄 Rodar novamente com esses parâmetros", disabled=not bt_allowed):
             if family == "smc":
                 manual_params = SMCParams(
                     swing_strength=st.session_state.cfg_swing_strength,
@@ -357,27 +462,23 @@ if st.session_state.strategy_interpreted:
                     initial_capital=initial_capital, position_size_pct=position_size_pct,
                 )
             else:
-                manual_params = StrategyParams(
-                    ma_type=st.session_state.cfg_ma_type,
-                    fast_period=st.session_state.cfg_fast_period,
-                    slow_period=st.session_state.cfg_slow_period,
-                    use_rsi_filter=st.session_state.cfg_use_rsi,
-                    rsi_period=st.session_state.cfg_rsi_period,
-                    rsi_oversold=st.session_state.cfg_rsi_oversold,
-                    rsi_overbought=st.session_state.cfg_rsi_overbought,
-                    stop_loss_pct=st.session_state.cfg_sl,
-                    take_profit_pct=st.session_state.cfg_tp,
-                    initial_capital=initial_capital, position_size_pct=position_size_pct,
-                )
+                manual_params = _classic_params_from_session(initial_capital, position_size_pct)
             st.session_state.cfg_timeframe = timeframe
             st.session_state.cfg_n_candles = default_candle_count(timeframe)
-            effective_run_mode = "Backtest Único" if family == "smc" else run_mode
+            if family == "smc":
+                effective_run_mode = "Backtest Único"
+            elif manual_params.entry_trigger != "ma_cross":
+                effective_run_mode = "Backtest Único"
+            else:
+                effective_run_mode = run_mode
             with st.spinner("Rodando backtest..."):
-                _run_backtest_flow(
+                ran = _run_backtest_flow(
                     family, market_type, st.session_state.cfg_symbol, timeframe,
                     st.session_state.cfg_n_candles, initial_capital, position_size_pct,
                     effective_run_mode, manual_params, opt_ranges, max_combinations,
                 )
+                if ran:
+                    rate_limiter.increment_usage(user_email, kind="backtest")
             st.rerun()
 
 

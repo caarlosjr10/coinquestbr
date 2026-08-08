@@ -10,7 +10,7 @@ Responsável por:
 """
 
 import itertools
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pandas as pd
@@ -190,19 +190,158 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return rsi_series.fillna(50)
 
 
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    """Retorna (linha MACD, linha de sinal, histograma)."""
+    macd_line = ema(series, fast) - ema(series, slow)
+    signal_line = ema(macd_line, signal)
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def bollinger_bands(series: pd.Series, period: int = 20, std: float = 2.0):
+    """Retorna (banda superior, banda média, banda inferior)."""
+    middle = sma(series, period)
+    rolling_std = series.rolling(window=period).std()
+    upper = middle + std * rolling_std
+    lower = middle - std * rolling_std
+    return upper, middle, lower
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Average True Range (suavização de Wilder)."""
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    true_range = pd.concat([
+        high - low, (high - prev_close).abs(), (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return true_range.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Average Directional Index — força da tendência (0-100), independente da direção."""
+    high, low = df["high"], df["low"]
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+
+    tr_smoothed = atr(df, period)
+    plus_di = 100 * plus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / tr_smoothed.replace(0, np.nan)
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / tr_smoothed.replace(0, np.nan)
+
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return dx.ewm(alpha=1 / period, min_periods=period, adjust=False).mean().fillna(0)
+
+
+def stochastic(df: pd.DataFrame, k_period: int = 14, d_period: int = 3):
+    """Retorna (%K, %D) do Oscilador Estocástico."""
+    low_min = df["low"].rolling(window=k_period).min()
+    high_max = df["high"].rolling(window=k_period).max()
+    percent_k = (100 * (df["close"] - low_min) / (high_max - low_min).replace(0, np.nan)).fillna(50)
+    percent_d = percent_k.rolling(window=d_period).mean()
+    return percent_k, percent_d
+
+
+def williams_r(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Williams %R (-100 a 0)."""
+    high_max = df["high"].rolling(window=period).max()
+    low_min = df["low"].rolling(window=period).min()
+    wr = (-100 * (high_max - df["close"]) / (high_max - low_min).replace(0, np.nan)).fillna(-50)
+    return wr
+
+
+def cci(df: pd.DataFrame, period: int = 20) -> pd.Series:
+    """Commodity Channel Index."""
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    sma_tp = typical_price.rolling(window=period).mean()
+    mean_dev = typical_price.rolling(window=period).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+    return ((typical_price - sma_tp) / (0.015 * mean_dev.replace(0, np.nan))).fillna(0)
+
+
+def donchian_channel(df: pd.DataFrame, period: int = 20):
+    """Retorna (canal superior, canal inferior) — máxima/mínima dos últimos `period` candles."""
+    upper = df["high"].rolling(window=period).max()
+    lower = df["low"].rolling(window=period).min()
+    return upper, lower
+
+
+def is_bullish_engulfing(df: pd.DataFrame) -> pd.Series:
+    prev_open, prev_close = df["open"].shift(1), df["close"].shift(1)
+    return (prev_close < prev_open) & (df["close"] > df["open"]) & (df["close"] >= prev_open) & (df["open"] <= prev_close)
+
+
+def is_bearish_engulfing(df: pd.DataFrame) -> pd.Series:
+    prev_open, prev_close = df["open"].shift(1), df["close"].shift(1)
+    return (prev_close > prev_open) & (df["close"] < df["open"]) & (df["close"] <= prev_open) & (df["open"] >= prev_close)
+
+
+def is_hammer(df: pd.DataFrame) -> pd.Series:
+    body = (df["close"] - df["open"]).abs()
+    lower_wick = df[["open", "close"]].min(axis=1) - df["low"]
+    upper_wick = df["high"] - df[["open", "close"]].max(axis=1)
+    return (lower_wick >= 2 * body) & (upper_wick <= body) & (body > 0)
+
+
+def is_shooting_star(df: pd.DataFrame) -> pd.Series:
+    body = (df["close"] - df["open"]).abs()
+    lower_wick = df[["open", "close"]].min(axis=1) - df["low"]
+    upper_wick = df["high"] - df[["open", "close"]].max(axis=1)
+    return (upper_wick >= 2 * body) & (lower_wick <= body) & (body > 0)
+
+
 # ---------------------------------------------------------------------------
 # Configuração da estratégia
 # ---------------------------------------------------------------------------
 
 @dataclass
 class StrategyParams:
-    ma_type: str = "EMA"           # "SMA" ou "EMA"
+    # --- Gatilho de entrada (escolha um) ---
+    entry_trigger: str = "ma_cross"  # "ma_cross" | "bb_reversal" | "donchian_breakout" | "candle_pattern"
+    ma_type: str = "EMA"             # "SMA" ou "EMA" — usado quando entry_trigger == "ma_cross"
     fast_period: int = 9
     slow_period: int = 21
+    bb_period: int = 20              # usado quando entry_trigger == "bb_reversal"
+    bb_std: float = 2.0
+    donchian_period: int = 20        # usado quando entry_trigger == "donchian_breakout"
+    candle_pattern: str = "bullish_engulfing"  # "bullish_engulfing" | "hammer" — usado quando entry_trigger == "candle_pattern"
+
+    # --- Filtros opcionais (combinados com E lógico sobre o gatilho) ---
     use_rsi_filter: bool = False
     rsi_period: int = 14
     rsi_oversold: int = 30
     rsi_overbought: int = 70
+
+    use_macd_filter: bool = False
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+
+    use_volume_filter: bool = False
+    volume_period: int = 20
+    volume_multiplier: float = 1.5
+
+    use_stochastic_filter: bool = False
+    stoch_k_period: int = 14
+    stoch_d_period: int = 3
+    stoch_oversold: int = 20
+    stoch_overbought: int = 80
+
+    use_adx_filter: bool = False
+    adx_period: int = 14
+    adx_threshold: float = 25.0
+
+    use_williams_filter: bool = False
+    williams_period: int = 14
+    williams_oversold: float = -80.0
+    williams_overbought: float = -20.0
+
+    use_cci_filter: bool = False
+    cci_period: int = 20
+    cci_oversold: float = -100.0
+    cci_overbought: float = 100.0
+
+    # --- Gestão de risco ---
     stop_loss_pct: float = 2.0
     take_profit_pct: float = 4.0
     initial_capital: float = 10000.0
@@ -247,30 +386,97 @@ def calculate_indicators(df: pd.DataFrame, params: StrategyParams) -> pd.DataFra
     df["ma_fast"] = ma_func(df["close"], params.fast_period)
     df["ma_slow"] = ma_func(df["close"], params.slow_period)
 
+    if params.entry_trigger == "bb_reversal":
+        df["bb_upper"], df["bb_middle"], df["bb_lower"] = bollinger_bands(df["close"], params.bb_period, params.bb_std)
+    if params.entry_trigger == "donchian_breakout":
+        df["donchian_upper"], df["donchian_lower"] = donchian_channel(df, params.donchian_period)
+
     if params.use_rsi_filter:
         df["rsi"] = rsi(df["close"], params.rsi_period)
+    if params.use_macd_filter:
+        df["macd_line"], df["macd_signal"], _ = macd(df["close"], params.macd_fast, params.macd_slow, params.macd_signal)
+    if params.use_volume_filter:
+        df["volume_ma"] = sma(df["volume"], params.volume_period)
+    if params.use_stochastic_filter:
+        df["stoch_k"], df["stoch_d"] = stochastic(df, params.stoch_k_period, params.stoch_d_period)
+    if params.use_adx_filter:
+        df["adx"] = adx(df, params.adx_period)
+    if params.use_williams_filter:
+        df["williams_r"] = williams_r(df, params.williams_period)
+    if params.use_cci_filter:
+        df["cci"] = cci(df, params.cci_period)
 
     return df
 
 
-def generate_signals(df: pd.DataFrame, params: StrategyParams) -> pd.DataFrame:
-    """Sinal de entrada: cruzamento da média rápida acima da lenta (+ filtro RSI opcional).
+def required_warmup_bars(params: StrategyParams) -> int:
+    """Nº mínimo de candles necessários para todos os indicadores ativados terem dados válidos."""
+    periods = [params.slow_period]
+    if params.entry_trigger == "bb_reversal":
+        periods.append(params.bb_period)
+    if params.entry_trigger == "donchian_breakout":
+        periods.append(params.donchian_period)
+    if params.use_rsi_filter:
+        periods.append(params.rsi_period)
+    if params.use_macd_filter:
+        periods.append(params.macd_slow + params.macd_signal)
+    if params.use_volume_filter:
+        periods.append(params.volume_period)
+    if params.use_stochastic_filter:
+        periods.append(params.stoch_k_period + params.stoch_d_period)
+    if params.use_adx_filter:
+        periods.append(params.adx_period * 2)
+    if params.use_williams_filter:
+        periods.append(params.williams_period)
+    if params.use_cci_filter:
+        periods.append(params.cci_period)
+    return max(periods) + 10
 
-    Este motor clássico só opera comprado — 'entry_short' fica sempre falso,
-    e o cruzamento de baixa funciona só como saída da posição comprada.
+
+def generate_signals(df: pd.DataFrame, params: StrategyParams) -> pd.DataFrame:
+    """Sinal de entrada a partir do gatilho escolhido (`entry_trigger`), com os
+    filtros opcionais ativados combinados por E lógico.
+
+    Este motor clássico só opera comprado — 'entry_short' fica sempre falso.
+    O sinal contrário ao gatilho funciona só como saída da posição comprada.
     """
     df = calculate_indicators(df, params)
 
-    cross_up = (df["ma_fast"] > df["ma_slow"]) & (df["ma_fast"].shift(1) <= df["ma_slow"].shift(1))
-    cross_down = (df["ma_fast"] < df["ma_slow"]) & (df["ma_fast"].shift(1) >= df["ma_slow"].shift(1))
+    if params.entry_trigger == "bb_reversal":
+        cross_up = (df["close"] > df["bb_lower"]) & (df["close"].shift(1) <= df["bb_lower"].shift(1))
+        cross_down = (df["close"] < df["bb_upper"]) & (df["close"].shift(1) >= df["bb_upper"].shift(1))
+    elif params.entry_trigger == "donchian_breakout":
+        cross_up = df["close"] > df["donchian_upper"].shift(1)
+        cross_down = df["close"] < df["donchian_lower"].shift(1)
+    elif params.entry_trigger == "candle_pattern":
+        if params.candle_pattern == "hammer":
+            cross_up = is_hammer(df)
+            cross_down = is_shooting_star(df)
+        else:
+            cross_up = is_bullish_engulfing(df)
+            cross_down = is_bearish_engulfing(df)
+    else:  # "ma_cross" (padrão)
+        cross_up = (df["ma_fast"] > df["ma_slow"]) & (df["ma_fast"].shift(1) <= df["ma_slow"].shift(1))
+        cross_down = (df["ma_fast"] < df["ma_slow"]) & (df["ma_fast"].shift(1) >= df["ma_slow"].shift(1))
 
     if params.use_rsi_filter:
-        rsi_ok = (df["rsi"] > params.rsi_oversold) & (df["rsi"] < params.rsi_overbought)
-        cross_up = cross_up & rsi_ok
+        cross_up = cross_up & (df["rsi"] > params.rsi_oversold) & (df["rsi"] < params.rsi_overbought)
+    if params.use_macd_filter:
+        cross_up = cross_up & (df["macd_line"] > df["macd_signal"])
+    if params.use_volume_filter:
+        cross_up = cross_up & (df["volume"] > df["volume_ma"] * params.volume_multiplier)
+    if params.use_stochastic_filter:
+        cross_up = cross_up & (df["stoch_k"] > params.stoch_oversold) & (df["stoch_k"] < params.stoch_overbought)
+    if params.use_adx_filter:
+        cross_up = cross_up & (df["adx"] > params.adx_threshold)
+    if params.use_williams_filter:
+        cross_up = cross_up & (df["williams_r"] > params.williams_oversold) & (df["williams_r"] < params.williams_overbought)
+    if params.use_cci_filter:
+        cross_up = cross_up & (df["cci"] > params.cci_oversold) & (df["cci"] < params.cci_overbought)
 
-    df["entry_long"] = cross_up
+    df["entry_long"] = cross_up.fillna(False)
     df["entry_short"] = False
-    df["exit_signal"] = cross_down
+    df["exit_signal"] = cross_down.fillna(False)
 
     return df
 
@@ -295,6 +501,36 @@ def _current_signal_from_df(signaled: pd.DataFrame, reason: str) -> dict:
     }
 
 
+def describe_trigger(params: StrategyParams) -> str:
+    if params.entry_trigger == "bb_reversal":
+        return f"Reversão Bollinger ({params.bb_period}, {params.bb_std})"
+    if params.entry_trigger == "donchian_breakout":
+        return f"Rompimento Donchian ({params.donchian_period})"
+    if params.entry_trigger == "candle_pattern":
+        label = "Engolfo de Alta" if params.candle_pattern == "bullish_engulfing" else "Martelo"
+        return f"Padrão de Candle: {label}"
+    return f"Cruzamento {params.ma_type} {params.fast_period}/{params.slow_period}"
+
+
+def describe_active_filters(params: StrategyParams) -> list:
+    labels = []
+    if params.use_rsi_filter:
+        labels.append("RSI")
+    if params.use_macd_filter:
+        labels.append("MACD")
+    if params.use_volume_filter:
+        labels.append("Volume")
+    if params.use_stochastic_filter:
+        labels.append("Estocástico")
+    if params.use_adx_filter:
+        labels.append("ADX")
+    if params.use_williams_filter:
+        labels.append("Williams %R")
+    if params.use_cci_filter:
+        labels.append("CCI")
+    return labels
+
+
 def get_current_signal(df: pd.DataFrame, params: StrategyParams) -> dict:
     """Inspeciona o último candle e informa se a estratégia clássica geraria um sinal agora.
 
@@ -304,9 +540,10 @@ def get_current_signal(df: pd.DataFrame, params: StrategyParams) -> dict:
     """
     signaled = generate_signals(df, params)
 
-    reason = f"Cruzamento {params.ma_type} {params.fast_period}/{params.slow_period}"
-    if params.use_rsi_filter:
-        reason += " + filtro RSI"
+    reason = describe_trigger(params)
+    filters = describe_active_filters(params)
+    if filters:
+        reason += " + filtro " + "/".join(filters)
 
     return _current_signal_from_df(signaled, reason)
 
@@ -613,19 +850,10 @@ def run_optimization(df: pd.DataFrame, base_params: StrategyParams,
         if fast >= slow:
             continue
 
-        params = StrategyParams(
-            ma_type=base_params.ma_type,
-            fast_period=fast,
-            slow_period=slow,
-            use_rsi_filter=base_params.use_rsi_filter,
-            rsi_period=base_params.rsi_period,
-            rsi_oversold=base_params.rsi_oversold,
-            rsi_overbought=base_params.rsi_overbought,
-            stop_loss_pct=sl,
-            take_profit_pct=tp,
-            initial_capital=base_params.initial_capital,
-            position_size_pct=base_params.position_size_pct,
-        )
+        # Preserva todos os outros campos (filtros, tipo de média etc.) do
+        # base_params — só o grid varia período rápido/lento e SL/TP.
+        params = replace(base_params, fast_period=fast, slow_period=slow,
+                          stop_loss_pct=sl, take_profit_pct=tp)
 
         trades, equity_df = run_backtest(df, params)
         metrics = calculate_metrics(trades, equity_df, params.initial_capital)

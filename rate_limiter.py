@@ -1,5 +1,6 @@
 """
-rate_limiter.py — Controle de limite mensal de Análises de IA por usuário.
+rate_limiter.py — Controle de limites mensais de uso por usuário (Análises de
+IA e Backtests), por plano.
 
 MVP: persistência simples em arquivo JSON local, identificando o usuário pelo
 e-mail informado na interface. Isso é suficiente para uso individual e para
@@ -19,11 +20,25 @@ from datetime import datetime
 
 USAGE_FILE = "usage_data.json"
 
-PLAN_LIMITS = {
+# "ai_parecer" = geração de parecer técnico com IA; "backtest" = clique em
+# "Analisar Estratégia" (interpretação + backtest). Cada um tem seu próprio
+# contador mensal por e-mail.
+AI_PARECER_LIMITS = {
     "Grátis": 1,
     "Pro": 50,
     "VIP": 500,
 }
+
+BACKTEST_LIMITS = {
+    "Grátis": 2,
+    "Pro": 500,
+    "VIP": 2000,
+}
+
+_LIMITS_BY_KIND = {"ai_parecer": AI_PARECER_LIMITS, "backtest": BACKTEST_LIMITS}
+
+# Mantido por compatibilidade com código antigo que importava PLAN_LIMITS.
+PLAN_LIMITS = AI_PARECER_LIMITS
 
 
 def _current_month_key() -> str:
@@ -45,38 +60,41 @@ def _save_usage(data: dict) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def get_usage_count(user_id: str) -> int:
-    """Retorna quantas análises de IA o usuário já fez no mês corrente."""
+def get_usage_count(user_id: str, kind: str = "ai_parecer") -> int:
+    """Retorna quantas vezes o usuário já usou essa funcionalidade no mês corrente."""
     data = _load_usage()
-    user_data = data.get(user_id, {})
+    kind_data = data.get(user_id, {}).get(kind, {})
 
-    if user_data.get("month") != _current_month_key():
+    if kind_data.get("month") != _current_month_key():
         return 0
 
-    return user_data.get("count", 0)
+    return kind_data.get("count", 0)
 
 
-def check_limit(user_id: str, plan: str) -> tuple[bool, int, int]:
-    """Verifica se o usuário ainda tem análises disponíveis no mês.
+def check_limit(user_id: str, plan: str, kind: str = "ai_parecer") -> tuple[bool, int, int]:
+    """Verifica se o usuário ainda tem uso disponível no mês para essa funcionalidade.
 
     Retorna (permitido, usado, limite).
     """
-    limit = PLAN_LIMITS.get(plan, PLAN_LIMITS["Grátis"])
-    used = get_usage_count(user_id)
+    limits = _LIMITS_BY_KIND.get(kind, AI_PARECER_LIMITS)
+    limit = limits.get(plan, limits["Grátis"])
+    used = get_usage_count(user_id, kind)
     return used < limit, used, limit
 
 
-def increment_usage(user_id: str) -> int:
+def increment_usage(user_id: str, kind: str = "ai_parecer") -> int:
     """Incrementa o contador de uso do usuário para o mês corrente e retorna o novo total."""
     data = _load_usage()
     month = _current_month_key()
-    user_data = data.get(user_id, {})
+    user_bucket = data.get(user_id, {})
+    kind_data = user_bucket.get(kind, {})
 
-    if user_data.get("month") != month:
-        user_data = {"month": month, "count": 0}
+    if kind_data.get("month") != month:
+        kind_data = {"month": month, "count": 0}
 
-    user_data["count"] = user_data.get("count", 0) + 1
-    data[user_id] = user_data
+    kind_data["count"] = kind_data.get("count", 0) + 1
+    user_bucket[kind] = kind_data
+    data[user_id] = user_bucket
     _save_usage(data)
 
-    return user_data["count"]
+    return kind_data["count"]

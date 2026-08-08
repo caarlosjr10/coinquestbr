@@ -295,7 +295,43 @@ def is_shooting_star(df: pd.DataFrame) -> pd.Series:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class StrategyParams:
+class RiskCostParams:
+    """Campos compartilhados por todas as famílias de estratégia: custos
+    operacionais (spread/slippage/comissão) e gerenciamento de Stop
+    Loss/Take Profit (percentual, pips ou múltiplo de ATR + trailing stop).
+
+    Custos são normalmente uma configuração da CORRETORA/conta, não da
+    estratégia em si — por isso ficam expostos como campos fixos na barra
+    lateral do app, em vez de serem extraídos pela IA do texto da estratégia.
+    """
+    # --- Custos operacionais (aplicados na abertura E no fechamento de cada trade) ---
+    spread_pct: float = 0.0        # spread do book, em % do preço
+    slippage_pct: float = 0.0      # slippage de execução, em % do preço
+    commission_pct: float = 0.0    # taxa de corretagem percentual (ex: 0.075 p/ Binance)
+    commission_fixed: float = 0.0  # custo fixo em unidades de preço (ex: pips de forex)
+
+    # --- Gerenciamento de Stop Loss / Take Profit ---
+    sl_tp_mode: str = "percent"    # "percent" | "pips" | "atr"
+    stop_loss_pct: float = 2.0
+    take_profit_pct: float = 4.0
+    stop_loss_pips: float = 20.0
+    take_profit_pips: float = 40.0
+    pip_size: float = 0.0001       # tamanho de 1 pip/ponto no preço do ativo
+    atr_period: int = 14
+    atr_sl_multiplier: float = 1.5
+    atr_tp_multiplier: float = 3.0
+
+    # --- Trailing Stop ---
+    use_trailing_stop: bool = False
+    trailing_activation_pct: float = 1.0  # lucro % necessário pra começar a mover o stop
+    trailing_distance_pct: float = 1.0    # distância % mantida em relação ao preço mais favorável
+
+    initial_capital: float = 10000.0
+    position_size_pct: float = 100.0  # % do capital alocado por trade
+
+
+@dataclass
+class StrategyParams(RiskCostParams):
     # --- Gatilho de entrada (escolha um) ---
     entry_trigger: str = "ma_cross"  # "ma_cross" | "bb_reversal" | "donchian_breakout" | "candle_pattern"
     ma_type: str = "EMA"             # "SMA" ou "EMA" — usado quando entry_trigger == "ma_cross"
@@ -341,11 +377,8 @@ class StrategyParams:
     cci_oversold: float = -100.0
     cci_overbought: float = 100.0
 
-    # --- Gestão de risco ---
-    stop_loss_pct: float = 2.0
-    take_profit_pct: float = 4.0
-    initial_capital: float = 10000.0
-    position_size_pct: float = 100.0  # % do capital alocado por trade
+    use_triple_ma: bool = False   # exige alinhamento total: ma_fast > ma_mid > ma_slow
+    mid_period: int = 14
 
 
 @dataclass
@@ -362,17 +395,13 @@ class Trade:
 
 
 @dataclass
-class SMCParams:
+class SMCParams(RiskCostParams):
     """Parâmetros da estratégia de reversão por Smart Money Concepts:
     varredura de liquidez -> BOS na direção contrária à varredura -> pullback
     de volta à zona varrida -> CHoCH a favor do movimento original (entrada).
     """
     swing_strength: int = 2       # candles de cada lado p/ confirmar um topo/fundo (fractal)
     max_setup_bars: int = 40      # janela máx. (em candles) entre a varredura e a confirmação de entrada
-    stop_loss_pct: float = 1.0
-    take_profit_pct: float = 2.0
-    initial_capital: float = 10000.0
-    position_size_pct: float = 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +414,9 @@ def calculate_indicators(df: pd.DataFrame, params: StrategyParams) -> pd.DataFra
 
     df["ma_fast"] = ma_func(df["close"], params.fast_period)
     df["ma_slow"] = ma_func(df["close"], params.slow_period)
+
+    if params.use_triple_ma:
+        df["ma_mid"] = ma_func(df["close"], params.mid_period)
 
     if params.entry_trigger == "bb_reversal":
         df["bb_upper"], df["bb_middle"], df["bb_lower"] = bollinger_bands(df["close"], params.bb_period, params.bb_std)
@@ -430,6 +462,18 @@ def required_warmup_bars(params: StrategyParams) -> int:
         periods.append(params.williams_period)
     if params.use_cci_filter:
         periods.append(params.cci_period)
+    if params.use_triple_ma:
+        periods.append(params.mid_period)
+    if params.sl_tp_mode == "atr":
+        periods.append(params.atr_period)
+    return max(periods) + 10
+
+
+def required_warmup_bars_smc(params: SMCParams) -> int:
+    """Nº mínimo de candles necessários para a estratégia SMC (estrutura + ATR se aplicável)."""
+    periods = [params.swing_strength * 2]
+    if params.sl_tp_mode == "atr":
+        periods.append(params.atr_period)
     return max(periods) + 10
 
 
@@ -473,6 +517,9 @@ def generate_signals(df: pd.DataFrame, params: StrategyParams) -> pd.DataFrame:
         cross_up = cross_up & (df["williams_r"] > params.williams_oversold) & (df["williams_r"] < params.williams_overbought)
     if params.use_cci_filter:
         cross_up = cross_up & (df["cci"] > params.cci_oversold) & (df["cci"] < params.cci_overbought)
+    if params.use_triple_ma:
+        cross_up = cross_up & (df["ma_fast"] > df["ma_mid"]) & (df["ma_mid"] > df["ma_slow"])
+        cross_down = cross_down & (df["ma_fast"] < df["ma_mid"]) & (df["ma_mid"] < df["ma_slow"])
 
     df["entry_long"] = cross_up.fillna(False)
     df["entry_short"] = False
@@ -528,7 +575,22 @@ def describe_active_filters(params: StrategyParams) -> list:
         labels.append("Williams %R")
     if params.use_cci_filter:
         labels.append("CCI")
+    if params.use_triple_ma:
+        labels.append(f"Alinhamento 3 Médias (+{params.mid_period})")
     return labels
+
+
+def describe_risk(params) -> str:
+    """Descreve o gerenciamento de Stop Loss/Take Profit (e trailing, se ativo)."""
+    if params.sl_tp_mode == "pips":
+        base = f"SL {params.stop_loss_pips}pips / TP {params.take_profit_pips}pips"
+    elif params.sl_tp_mode == "atr":
+        base = f"SL {params.atr_sl_multiplier}x ATR({params.atr_period}) / TP {params.atr_tp_multiplier}x ATR({params.atr_period})"
+    else:
+        base = f"SL {params.stop_loss_pct}% / TP {params.take_profit_pct}%"
+    if params.use_trailing_stop:
+        base += f" · trailing após {params.trailing_activation_pct}% (dist. {params.trailing_distance_pct}%)"
+    return base
 
 
 def get_current_signal(df: pd.DataFrame, params: StrategyParams) -> dict:
@@ -552,39 +614,115 @@ def get_current_signal(df: pd.DataFrame, params: StrategyParams) -> dict:
 # Backtest (compra e venda a descoberto)
 # ---------------------------------------------------------------------------
 
-def _simulate(df: pd.DataFrame, stop_loss_pct: float, take_profit_pct: float,
-              initial_capital: float, position_size_pct: float):
+def _apply_costs(price: float, direction: str, side: str, params) -> float:
+    """Aplica spread + slippage + comissão como uma piora no preço de execução
+    (sempre desfavorável ao trader), tanto na entrada quanto na saída do trade.
+    """
+    pct_cost = (params.spread_pct + params.slippage_pct + params.commission_pct) / 100.0
+    fixed_cost_pct = (params.commission_fixed / price) if price else 0.0
+    total_pct = pct_cost + fixed_cost_pct
+
+    worse_up = (direction == "long" and side == "entry") or (direction == "short" and side == "exit")
+    return price * (1 + total_pct) if worse_up else price * (1 - total_pct)
+
+
+def _resolve_sl_tp_pct(params, entry_price: float, atr_value) -> tuple:
+    """Resolve o Stop Loss/Take Profit (em % do preço de entrada) conforme o
+    modo escolhido: percentual direto, pips/pontos fixos, ou múltiplo de ATR.
+    """
+    if params.sl_tp_mode == "pips":
+        sl_pct = (params.stop_loss_pips * params.pip_size / entry_price) * 100
+        tp_pct = (params.take_profit_pips * params.pip_size / entry_price) * 100
+    elif params.sl_tp_mode == "atr" and atr_value and not np.isnan(atr_value):
+        sl_pct = (params.atr_sl_multiplier * atr_value / entry_price) * 100
+        tp_pct = (params.atr_tp_multiplier * atr_value / entry_price) * 100
+    else:
+        sl_pct, tp_pct = params.stop_loss_pct, params.take_profit_pct
+
+    return max(sl_pct, 0.01), max(tp_pct, 0.01)
+
+
+def _simulate(df: pd.DataFrame, params):
     """Loop de simulação compartilhado por todas as famílias de estratégia.
 
     Espera um DataFrame com as colunas 'entry_long', 'entry_short' e
-    'exit_signal' já calculadas. Suporta posições compradas e vendidas —
-    o P&L e o Stop Loss/Take Profit são espelhados conforme a direção.
+    'exit_signal' já calculadas (mais 'open'/'high'/'low'/'close'). Suporta
+    posições compradas e vendidas, custos operacionais (spread/slippage/
+    comissão), Stop Loss/Take Profit em % / pips / múltiplo de ATR, e
+    trailing stop.
+
+    Indicadores usados pelo motor (ATR, quando `sl_tp_mode == "atr"`) são
+    pré-calculados de forma vetorizada em pandas antes do loop — o loop em si
+    só faz leituras O(1) num array numpy, pois o estado de uma posição aberta
+    (trailing stop, P&L acumulado) é inerentemente sequencial e não dá pra
+    vetorizar sem reescrever o motor como uma simulação orientada a eventos.
     """
-    equity = initial_capital
+    if params.sl_tp_mode == "atr":
+        atr_arr = atr(df, params.atr_period).to_numpy()
+    else:
+        atr_arr = None
+
+    high_arr = df["high"].to_numpy()
+    low_arr = df["low"].to_numpy()
+    close_arr = df["close"].to_numpy()
+    entry_long_arr = df["entry_long"].to_numpy()
+    entry_short_arr = df["entry_short"].to_numpy()
+    exit_signal_arr = df["exit_signal"].to_numpy()
+    idx_arr = df.index
+
+    equity = params.initial_capital
     equity_curve = []
     trades: list[Trade] = []
 
     position_open = False
     current_trade: Trade | None = None
+    stop_price = take_price = best_price = None
+    trailing_engaged = False
 
-    for idx, row in df.iterrows():
-        price = row["close"]
+    for t in range(len(df)):
+        idx = idx_arr[t]
+        high, low, close = high_arr[t], low_arr[t], close_arr[t]
 
         if position_open:
-            if current_trade.direction == "long":
-                change_pct = (price - current_trade.entry_price) / current_trade.entry_price * 100
-            else:
-                change_pct = (current_trade.entry_price - price) / current_trade.entry_price * 100
+            direction = current_trade.direction
 
-            hit_sl = change_pct <= -stop_loss_pct
-            hit_tp = change_pct >= take_profit_pct
-            hit_cross_exit = bool(row["exit_signal"])
+            if direction == "long":
+                best_price = max(best_price, high)
+                if params.use_trailing_stop:
+                    profit_pct = (best_price - current_trade.entry_price) / current_trade.entry_price * 100
+                    if profit_pct >= params.trailing_activation_pct:
+                        candidate = best_price * (1 - params.trailing_distance_pct / 100)
+                        if candidate > stop_price:
+                            stop_price = candidate
+                            trailing_engaged = True
+                hit_sl = low <= stop_price
+                hit_tp = high >= take_price
+            else:
+                best_price = min(best_price, low)
+                if params.use_trailing_stop:
+                    profit_pct = (current_trade.entry_price - best_price) / current_trade.entry_price * 100
+                    if profit_pct >= params.trailing_activation_pct:
+                        candidate = best_price * (1 + params.trailing_distance_pct / 100)
+                        if candidate < stop_price:
+                            stop_price = candidate
+                            trailing_engaged = True
+                hit_sl = high >= stop_price
+                hit_tp = low <= take_price
+
+            hit_cross_exit = bool(exit_signal_arr[t])
 
             if hit_sl or hit_tp or hit_cross_exit:
-                exit_price = price
-                reason = "Stop Loss" if hit_sl else ("Take Profit" if hit_tp else "Cruzamento")
+                if hit_sl:
+                    raw_exit_price = stop_price
+                    reason = "Trailing Stop" if trailing_engaged else "Stop Loss"
+                elif hit_tp:
+                    raw_exit_price, reason = take_price, "Take Profit"
+                else:
+                    raw_exit_price, reason = close, "Cruzamento"
 
-                if current_trade.direction == "long":
+                exit_price = _apply_costs(raw_exit_price, direction, "exit", params)
+
+                if direction == "long":
                     pnl_pct = (exit_price - current_trade.entry_price) / current_trade.entry_price
                 else:
                     pnl_pct = (current_trade.entry_price - exit_price) / current_trade.entry_price
@@ -601,29 +739,41 @@ def _simulate(df: pd.DataFrame, stop_loss_pct: float, take_profit_pct: float,
 
                 position_open = False
                 current_trade = None
+                stop_price = take_price = best_price = None
+                trailing_engaged = False
 
-        elif bool(row.get("entry_long", False)):
-            size = equity * (position_size_pct / 100.0)
-            current_trade = Trade(entry_time=idx, entry_price=price, size=size, direction="long")
-            position_open = True
-        elif bool(row.get("entry_short", False)):
-            size = equity * (position_size_pct / 100.0)
-            current_trade = Trade(entry_time=idx, entry_price=price, size=size, direction="short")
+        elif bool(entry_long_arr[t]) or bool(entry_short_arr[t]):
+            direction = "long" if entry_long_arr[t] else "short"
+            entry_price = _apply_costs(close, direction, "entry", params)
+
+            atr_value = atr_arr[t] if atr_arr is not None else None
+            sl_pct, tp_pct = _resolve_sl_tp_pct(params, entry_price, atr_value)
+
+            if direction == "long":
+                stop_price = entry_price * (1 - sl_pct / 100)
+                take_price = entry_price * (1 + tp_pct / 100)
+            else:
+                stop_price = entry_price * (1 + sl_pct / 100)
+                take_price = entry_price * (1 - tp_pct / 100)
+            best_price = entry_price
+
+            size = equity * (params.position_size_pct / 100.0)
+            current_trade = Trade(entry_time=idx, entry_price=entry_price, size=size, direction=direction)
             position_open = True
 
         equity_curve.append({"timestamp": idx, "equity": equity})
 
     # Fecha posição aberta ao final do período pelo último preço disponível
     if position_open and current_trade is not None:
-        last_price = df["close"].iloc[-1]
+        exit_price = _apply_costs(close_arr[-1], current_trade.direction, "exit", params)
         if current_trade.direction == "long":
-            pnl_pct = (last_price - current_trade.entry_price) / current_trade.entry_price
+            pnl_pct = (exit_price - current_trade.entry_price) / current_trade.entry_price
         else:
-            pnl_pct = (current_trade.entry_price - last_price) / current_trade.entry_price
+            pnl_pct = (current_trade.entry_price - exit_price) / current_trade.entry_price
         pnl = current_trade.size * pnl_pct
 
         current_trade.exit_time = df.index[-1]
-        current_trade.exit_price = last_price
+        current_trade.exit_price = exit_price
         current_trade.exit_reason = "Fim do período"
         current_trade.pnl = pnl
         current_trade.pnl_pct = pnl_pct * 100
@@ -639,8 +789,7 @@ def _simulate(df: pd.DataFrame, stop_loss_pct: float, take_profit_pct: float,
 def run_backtest(df: pd.DataFrame, params: StrategyParams):
     """Executa o backtest da estratégia clássica (cruzamento de médias)."""
     signaled = generate_signals(df, params)
-    return _simulate(signaled, params.stop_loss_pct, params.take_profit_pct,
-                      params.initial_capital, params.position_size_pct)
+    return _simulate(signaled, params)
 
 
 # ---------------------------------------------------------------------------
@@ -770,8 +919,7 @@ def generate_smc_signals(df: pd.DataFrame, params: SMCParams) -> pd.DataFrame:
 def run_backtest_smc(df: pd.DataFrame, params: SMCParams):
     """Executa o backtest da estratégia SMC (varredura + BOS + pullback + CHoCH)."""
     signaled = generate_smc_signals(df, params)
-    return _simulate(signaled, params.stop_loss_pct, params.take_profit_pct,
-                      params.initial_capital, params.position_size_pct)
+    return _simulate(signaled, params)
 
 
 def get_current_signal_smc(df: pd.DataFrame, params: SMCParams) -> dict:
@@ -785,12 +933,92 @@ def get_current_signal_smc(df: pd.DataFrame, params: SMCParams) -> dict:
 # Métricas
 # ---------------------------------------------------------------------------
 
+def _infer_periods_per_year(equity_df: pd.DataFrame) -> float:
+    """Estima quantos candles cabem em um ano, a partir do intervalo médio
+    entre candles do equity_df — usado para anualizar o Sharpe Ratio."""
+    if len(equity_df) < 2:
+        return 252.0
+    avg_delta_seconds = (equity_df.index[-1] - equity_df.index[0]).total_seconds() / (len(equity_df) - 1)
+    if avg_delta_seconds <= 0:
+        return 252.0
+    seconds_per_year = 365.25 * 24 * 3600
+    return seconds_per_year / avg_delta_seconds
+
+
+def _sharpe_ratio(equity_df: pd.DataFrame) -> float:
+    """Sharpe Ratio anualizado sobre os retornos por candle do equity_df
+    (taxa livre de risco assumida em 0, prática comum em backtests de varejo)."""
+    equity_series = equity_df["equity"]
+    returns = equity_series.pct_change().dropna()
+    if len(returns) < 2 or returns.std() == 0:
+        return 0.0
+    periods_per_year = _infer_periods_per_year(equity_df)
+    return float((returns.mean() / returns.std()) * np.sqrt(periods_per_year))
+
+
+def _max_consecutive_losses(trades: list[Trade]) -> int:
+    """Maior sequência de trades perdedores seguidos (vetorizado via groupby)."""
+    if not trades:
+        return 0
+    is_loss = pd.Series([t.pnl <= 0 for t in trades])
+    groups = (is_loss != is_loss.shift()).cumsum()
+    streaks = is_loss.groupby(groups).transform("size") * is_loss
+    return int(streaks.max()) if len(streaks) else 0
+
+
+def _avg_trade_duration(trades: list[Trade]) -> pd.Timedelta:
+    durations = [t.exit_time - t.entry_time for t in trades if t.exit_time is not None]
+    if not durations:
+        return pd.Timedelta(0)
+    return pd.Series(durations).mean()
+
+
+def _max_drawdown_duration(equity_df: pd.DataFrame) -> pd.Timedelta:
+    """Maior tempo decorrido entre um novo pico de patrimônio e o momento em
+    que o patrimônio volta a alcançá-lo (ou o fim dos dados, se nunca recuperar).
+    Totalmente vetorizado: sem loop explícito sobre os candles.
+    """
+    equity_series = equity_df["equity"]
+    if len(equity_series) < 2:
+        return pd.Timedelta(0)
+
+    running_max = equity_series.cummax()
+    at_peak = equity_series >= running_max
+
+    peak_times = equity_series.index.to_series().where(at_peak).ffill()
+    duration = equity_series.index.to_series() - peak_times
+
+    max_duration = duration.max()
+    return max_duration if pd.notna(max_duration) else pd.Timedelta(0)
+
+
+def format_timedelta(td: pd.Timedelta) -> str:
+    """Formata um Timedelta de forma compacta e legível (ex: '2d 5h', '45min')."""
+    if td is None or pd.isna(td) or td <= pd.Timedelta(0):
+        return "—"
+
+    total_seconds = int(td.total_seconds())
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}min"
+    if minutes > 0:
+        return f"{minutes}min"
+    return f"{total_seconds}s"
+
+
 def calculate_metrics(trades: list[Trade], equity_df: pd.DataFrame, initial_capital: float) -> dict:
     if not trades:
         return {
             "total_trades": 0, "win_rate": 0.0, "profit_factor": 0.0,
             "max_drawdown_pct": 0.0, "payoff": 0.0, "expectancy": 0.0,
             "net_profit": 0.0, "net_profit_pct": 0.0, "final_equity": initial_capital,
+            "sharpe_ratio": 0.0, "max_consecutive_losses": 0,
+            "avg_trade_duration": pd.Timedelta(0), "max_drawdown_duration": pd.Timedelta(0),
         }
 
     pnls = np.array([t.pnl for t in trades])
@@ -831,6 +1059,10 @@ def calculate_metrics(trades: list[Trade], equity_df: pd.DataFrame, initial_capi
         "net_profit": round(net_profit, 2),
         "net_profit_pct": round(net_profit_pct, 2),
         "final_equity": round(final_equity, 2),
+        "sharpe_ratio": round(_sharpe_ratio(equity_df), 2),
+        "max_consecutive_losses": _max_consecutive_losses(trades),
+        "avg_trade_duration": _avg_trade_duration(trades),
+        "max_drawdown_duration": _max_drawdown_duration(equity_df),
     }
 
 

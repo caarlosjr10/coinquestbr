@@ -23,11 +23,14 @@ from engine import (
     calculate_metrics,
     default_candle_count,
     describe_active_filters,
+    describe_risk,
     describe_trigger,
     fetch_data,
+    format_timedelta,
     get_current_signal,
     get_current_signal_smc,
     required_warmup_bars,
+    required_warmup_bars_smc,
     resolve_symbol,
     run_backtest,
     run_backtest_smc,
@@ -35,6 +38,17 @@ from engine import (
     timeframe_options,
 )
 from integrations import telegram_bot
+
+# Campos de gerenciamento de risco (SL/TP em % / pips / ATR + trailing stop) —
+# compartilhados por QUALQUER família de estratégia (RiskCostParams em
+# engine.py), extraídos pela IA do texto porque variam por estratégia.
+# spread/slippage/comissão ficam de fora: são configuração de corretora/conta,
+# não da estratégia, então viram campos fixos na barra lateral.
+RISK_COST_PARAM_FIELDS = [
+    "sl_tp_mode", "stop_loss_pips", "take_profit_pips",
+    "atr_period", "atr_sl_multiplier", "atr_tp_multiplier",
+    "use_trailing_stop", "trailing_activation_pct", "trailing_distance_pct",
+]
 
 # Campos de StrategyParams preenchidos pela IA (strategy_parser) e espelhados
 # em st.session_state como "cfg_<campo>" — usados tanto para montar o
@@ -51,7 +65,8 @@ CLASSIC_PARAM_FIELDS = [
     "use_adx_filter", "adx_period", "adx_threshold",
     "use_williams_filter", "williams_period", "williams_oversold", "williams_overbought",
     "use_cci_filter", "cci_period", "cci_oversold", "cci_overbought",
-]
+    "use_triple_ma", "mid_period",
+] + RISK_COST_PARAM_FIELDS
 
 # ---------------------------------------------------------------------------
 # Estado da sessão
@@ -74,24 +89,36 @@ for key, default in {
         st.session_state[key] = default
 
 
-def _classic_params_from_session(initial_capital=10000.0, position_size_pct=100.0) -> StrategyParams:
+def _classic_params_from_session(initial_capital=10000.0, position_size_pct=100.0, **cost_kwargs) -> StrategyParams:
     return StrategyParams(
         **{k: st.session_state[f"cfg_{k}"] for k in CLASSIC_PARAM_FIELDS},
         stop_loss_pct=st.session_state.cfg_sl, take_profit_pct=st.session_state.cfg_tp,
         initial_capital=initial_capital, position_size_pct=position_size_pct,
+        **cost_kwargs,
+    )
+
+
+def _smc_params_from_session(initial_capital=10000.0, position_size_pct=100.0, **cost_kwargs) -> SMCParams:
+    return SMCParams(
+        swing_strength=st.session_state.cfg_swing_strength,
+        max_setup_bars=st.session_state.cfg_max_setup_bars,
+        **{k: st.session_state[f"cfg_{k}"] for k in RISK_COST_PARAM_FIELDS},
+        stop_loss_pct=st.session_state.cfg_sl, take_profit_pct=st.session_state.cfg_tp,
+        initial_capital=initial_capital, position_size_pct=position_size_pct,
+        **cost_kwargs,
     )
 
 
 def _classic_desc(p: StrategyParams, suffix="") -> str:
     filters = describe_active_filters(p)
     filters_txt = f" + filtro {'/'.join(filters)}" if filters else ""
-    return f"{describe_trigger(p)}{filters_txt}, SL {p.stop_loss_pct}% / TP {p.take_profit_pct}%{suffix}"
+    return f"{describe_trigger(p)}{filters_txt}, {describe_risk(p)}{suffix}"
 
 
 def _smc_desc(p: SMCParams, suffix="") -> str:
     return (
         f"Reversão SMC — varredura + BOS + pullback + CHoCH (swing={p.swing_strength}, "
-        f"janela={p.max_setup_bars} candles), SL {p.stop_loss_pct}% / TP {p.take_profit_pct}%{suffix}"
+        f"janela={p.max_setup_bars} candles), {describe_risk(p)}{suffix}"
     )
 
 
@@ -108,7 +135,7 @@ def _run_backtest_flow(family, market_type, symbol, timeframe, n_candles, initia
         st.error(f"Erro ao buscar dados para '{symbol}': {e}")
         return False
 
-    min_bars = required_warmup_bars(base_params) if family == "classic" else base_params.swing_strength * 2 + 10
+    min_bars = required_warmup_bars(base_params) if family == "classic" else required_warmup_bars_smc(base_params)
     if df.empty or len(df) < min_bars:
         st.error("Dados insuficientes para essa configuração. Tente aumentar o número de candles.")
         return False
@@ -179,9 +206,40 @@ is_vip = user_plan == "VIP"
 st.sidebar.info(f"Plano atual: **{user_plan}**")
 st.sidebar.page_link("views/planos.py", label="Ver planos e assinar", icon="💳")
 
-st.sidebar.subheader("2. Capital")
+st.sidebar.subheader("2. Capital e Custos")
 initial_capital = st.sidebar.number_input("Capital Inicial", min_value=100.0, value=10000.0, step=100.0)
 position_size_pct = 100.0  # simplificado: sempre 100% do capital alocado por trade
+
+with st.sidebar.expander("Custos operacionais"):
+    st.caption("Configuração da sua corretora — descontada na abertura e no fechamento de cada trade.")
+    spread_pct = st.number_input(
+        "Spread (%)", min_value=0.0, max_value=5.0, value=0.0, step=0.01, format="%.3f",
+        help="Diferença entre preço de compra e venda do book.",
+    )
+    slippage_pct = st.number_input(
+        "Slippage (%)", min_value=0.0, max_value=5.0, value=0.0, step=0.01, format="%.3f",
+        help="Derrapagem esperada na execução, além do spread.",
+    )
+    commission_pct = st.number_input(
+        "Comissão da corretora (%)", min_value=0.0, max_value=5.0, value=0.0, step=0.001, format="%.3f",
+        help="Ex: 0.075% é a taxa taker padrão da Binance para Cripto.",
+    )
+    commission_fixed = st.number_input(
+        "Custo fixo por operação (em pontos do preço)", min_value=0.0, value=0.0, step=0.0001, format="%.5f",
+        help="Ex: um custo fixo de alguns pips numa corretora forex. Deixe 0 se não se aplica.",
+    )
+    pip_size = st.number_input(
+        "Tamanho de 1 pip/ponto do ativo", min_value=0.000001, value=0.0001, step=0.0001, format="%.6f",
+        help=(
+            "Usado só quando o Stop Loss/Take Profit da estratégia estiver em modo "
+            "'pips'. Padrão 0.0001 para a maioria dos pares forex — ajuste para "
+            "0.01 em pares com JPY, ações ou índices."
+        ),
+    )
+cost_kwargs = dict(
+    spread_pct=spread_pct, slippage_pct=slippage_pct,
+    commission_pct=commission_pct, commission_fixed=commission_fixed, pip_size=pip_size,
+)
 
 st.sidebar.subheader("3. Modo de Execução")
 run_mode = st.sidebar.radio(
@@ -297,10 +355,14 @@ if st.button("🚀 Analisar Estratégia", type="primary", disabled=not (user_ema
                 if family == "smc":
                     st.session_state.cfg_swing_strength = parsed["swing_strength"]
                     st.session_state.cfg_max_setup_bars = parsed["max_setup_bars"]
+                    for k in RISK_COST_PARAM_FIELDS:
+                        st.session_state[f"cfg_{k}"] = parsed[k]
                     base_params = SMCParams(
                         swing_strength=parsed["swing_strength"], max_setup_bars=parsed["max_setup_bars"],
+                        **{k: parsed[k] for k in RISK_COST_PARAM_FIELDS},
                         stop_loss_pct=parsed["stop_loss_pct"], take_profit_pct=parsed["take_profit_pct"],
                         initial_capital=initial_capital, position_size_pct=position_size_pct,
+                        **cost_kwargs,
                     )
                     if run_mode != "Backtest Único":
                         st.info("Otimização automática ainda não está disponível para estratégias SMC — rodando o backtest único.")
@@ -312,9 +374,11 @@ if st.button("🚀 Analisar Estratégia", type="primary", disabled=not (user_ema
                         **{k: parsed[k] for k in CLASSIC_PARAM_FIELDS},
                         stop_loss_pct=parsed["stop_loss_pct"], take_profit_pct=parsed["take_profit_pct"],
                         initial_capital=initial_capital, position_size_pct=position_size_pct,
+                        **cost_kwargs,
                     )
-                    if base_params.entry_trigger != "ma_cross" and run_mode != "Backtest Único":
-                        st.info("Otimização automática só está disponível para o gatilho de cruzamento de médias — rodando o backtest único.")
+                    unsupported_opt = base_params.entry_trigger != "ma_cross" or base_params.sl_tp_mode != "percent"
+                    if unsupported_opt and run_mode != "Backtest Único":
+                        st.info("Otimização automática só está disponível para o gatilho de cruzamento de médias com SL/TP percentual — rodando o backtest único.")
                         effective_run_mode = "Backtest Único"
 
                 ran = _run_backtest_flow(
@@ -337,11 +401,7 @@ if st.session_state.strategy_supported is False:
 
 if st.session_state.strategy_interpreted:
     if st.session_state.strategy_family == "smc":
-        strategy_desc = _smc_desc(SMCParams(
-            swing_strength=st.session_state.cfg_swing_strength,
-            max_setup_bars=st.session_state.cfg_max_setup_bars,
-            stop_loss_pct=st.session_state.cfg_sl, take_profit_pct=st.session_state.cfg_tp,
-        ))
+        strategy_desc = _smc_desc(_smc_params_from_session())
     else:
         strategy_desc = _classic_desc(_classic_params_from_session())
 
@@ -446,28 +506,55 @@ if st.session_state.strategy_interpreted:
                 col_co.number_input("Sobrevenda", min_value=-300.0, max_value=-50.0, step=10.0, key="cfg_cci_oversold")
                 col_cb.number_input("Sobrecompra", min_value=50.0, max_value=300.0, step=10.0, key="cfg_cci_overbought")
 
-        col_sl, col_tp = st.columns(2)
-        col_sl.number_input("Stop Loss (%)", min_value=0.1, max_value=50.0, step=0.1, key="cfg_sl")
-        col_tp.number_input("Take Profit (%)", min_value=0.1, max_value=100.0, step=0.1, key="cfg_tp")
+            use_triple_ma = st.checkbox(
+                "Alinhamento de 3 Médias Móveis", key="cfg_use_triple_ma",
+                help="Exige Média Rápida > Média Intermediária > Média Lenta (ou o inverso p/ saída) antes de disparar o sinal.",
+            )
+            if use_triple_ma:
+                st.number_input("Período da Média Intermediária", min_value=2, max_value=300, key="cfg_mid_period")
+
+        st.markdown("**Gerenciamento de Stop Loss / Take Profit**")
+        sl_tp_labels = {"percent": "Percentual (%)", "pips": "Pips / Pontos Fixos", "atr": "Múltiplo de ATR"}
+        st.selectbox(
+            "Modo de cálculo", list(sl_tp_labels.keys()), format_func=lambda k: sl_tp_labels[k], key="cfg_sl_tp_mode",
+        )
+
+        if st.session_state.cfg_sl_tp_mode == "pips":
+            col_slp, col_tpp = st.columns(2)
+            col_slp.number_input("Stop Loss (pips)", min_value=0.1, max_value=2000.0, step=1.0, key="cfg_stop_loss_pips")
+            col_tpp.number_input("Take Profit (pips)", min_value=0.1, max_value=4000.0, step=1.0, key="cfg_take_profit_pips")
+        elif st.session_state.cfg_sl_tp_mode == "atr":
+            col_atp, col_atsl, col_attp = st.columns(3)
+            col_atp.number_input("Período ATR", min_value=2, max_value=100, key="cfg_atr_period")
+            col_atsl.number_input("Múlt. SL (x ATR)", min_value=0.1, max_value=10.0, step=0.1, key="cfg_atr_sl_multiplier")
+            col_attp.number_input("Múlt. TP (x ATR)", min_value=0.1, max_value=20.0, step=0.1, key="cfg_atr_tp_multiplier")
+        else:
+            col_sl, col_tp = st.columns(2)
+            col_sl.number_input("Stop Loss (%)", min_value=0.1, max_value=50.0, step=0.1, key="cfg_sl")
+            col_tp.number_input("Take Profit (%)", min_value=0.1, max_value=100.0, step=0.1, key="cfg_tp")
+
+        use_trailing_stop = st.checkbox("Trailing Stop (stop móvel)", key="cfg_use_trailing_stop")
+        if use_trailing_stop:
+            col_tra, col_trd = st.columns(2)
+            col_tra.number_input(
+                "Ativa após lucro de (%)", min_value=0.05, max_value=50.0, step=0.1, key="cfg_trailing_activation_pct",
+            )
+            col_trd.number_input(
+                "Distância do preço (%)", min_value=0.05, max_value=50.0, step=0.1, key="cfg_trailing_distance_pct",
+            )
 
         if not bt_allowed:
             st.caption(f"⚠️ Limite de {bt_limit} backtests do plano {user_plan} atingido este mês.")
         if st.button("🔄 Rodar novamente com esses parâmetros", disabled=not bt_allowed):
             if family == "smc":
-                manual_params = SMCParams(
-                    swing_strength=st.session_state.cfg_swing_strength,
-                    max_setup_bars=st.session_state.cfg_max_setup_bars,
-                    stop_loss_pct=st.session_state.cfg_sl,
-                    take_profit_pct=st.session_state.cfg_tp,
-                    initial_capital=initial_capital, position_size_pct=position_size_pct,
-                )
+                manual_params = _smc_params_from_session(initial_capital, position_size_pct, **cost_kwargs)
             else:
-                manual_params = _classic_params_from_session(initial_capital, position_size_pct)
+                manual_params = _classic_params_from_session(initial_capital, position_size_pct, **cost_kwargs)
             st.session_state.cfg_timeframe = timeframe
             st.session_state.cfg_n_candles = default_candle_count(timeframe)
             if family == "smc":
                 effective_run_mode = "Backtest Único"
-            elif manual_params.entry_trigger != "ma_cross":
+            elif manual_params.entry_trigger != "ma_cross" or manual_params.sl_tp_mode != "percent":
                 effective_run_mode = "Backtest Único"
             else:
                 effective_run_mode = run_mode
@@ -511,6 +598,12 @@ else:
     m4.metric("Payoff", metrics["payoff"])
     m5.metric("Expectativa", metrics["expectancy"])
     m6.metric("Resultado Líquido", f"{metrics['net_profit_pct']}%")
+
+    m7, m8, m9, m10 = st.columns(4)
+    m7.metric("Sharpe Ratio", metrics["sharpe_ratio"])
+    m8.metric("Máx. Derrotas Seguidas", metrics["max_consecutive_losses"])
+    m9.metric("Tempo Médio por Trade", format_timedelta(metrics["avg_trade_duration"]))
+    m10.metric("Duração do Drawdown Máx.", format_timedelta(metrics["max_drawdown_duration"]))
 
     st.markdown(f"**Total de Trades:** {metrics['total_trades']} &nbsp;|&nbsp; "
                 f"**Capital Final:** {metrics['final_equity']:,.2f}")
